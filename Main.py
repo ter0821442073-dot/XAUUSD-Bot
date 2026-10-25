@@ -1,7 +1,6 @@
 import time
 import requests
 import pandas as pd
-import pandas_ta as ta
 import yfinance as yf
 
 # ==========================================
@@ -13,7 +12,6 @@ SHEET_ID = "10aE1bClTH6Ru1vu8rWZwA_yWg4EnMAnWJtdVeMrFYmo"
 
 SYMBOL = "GC=F"  # ราคาทองคำ XAUUSD (Gold Futures)
 
-# ตัวแปรบันทึกเวลาแจ้งเตือนล่าสุดแยกตาม Timeframe เพื่อป้องกันเตือนซ้ำในแท่งเดิม
 last_alert_time = {"1h": None, "4h": None}
 
 def get_levels_from_google_sheet():
@@ -49,6 +47,20 @@ def send_telegram_message(message):
     except Exception as e:
         print(f"Telegram Error: {e}")
 
+def calculate_stoch(df, k_period=14, d_period=3, smooth_k=3):
+    """คำนวณ Stochastic ด้วย Pandas ล้วนๆ ไม่ต้องใช้ Numba"""
+    low_min = df['Low'].rolling(window=k_period).min()
+    high_max = df['High'].rolling(window=k_period).max()
+    
+    # %K ดิบ
+    k_raw = 100 * ((df['Close'] - low_min) / (high_max - low_min))
+    # Smooth %K
+    stoch_k = k_raw.rolling(window=smooth_k).mean()
+    # %D
+    stoch_d = stoch_k.rolling(window=d_period).mean()
+    
+    return stoch_k, stoch_d
+
 def check_market():
     global last_alert_time
     
@@ -64,12 +76,13 @@ def check_market():
             if df.empty or len(df) < 20:
                 continue
 
-            stoch = ta.stoch(high=df['High'], low=df['Low'], close=df['Close'], k=14, d=3, smooth_k=3)
+            # คำนวณ Stoch
+            stoch_k, _ = calculate_stoch(df)
             
             current_time = str(df.index[-2])
             current_high = float(df['High'].iloc[-2])
             current_low = float(df['Low'].iloc[-2])
-            k_value = float(stoch['STOCHk_14_3_3'].iloc[-2])
+            k_value = float(stoch_k.iloc[-2])
 
             res_level = levels[tf]["res"]
             sup_level = levels[tf]["sup"]
@@ -79,7 +92,7 @@ def check_market():
             if last_alert_time[tf] == current_time:
                 continue
 
-            # เงื่อนไข SELL: ราคาชนแนวต้าน + Stoch >= 80 พร้อมกัน
+            # เงื่อนไข SELL
             if current_high >= res_level and k_value >= 80:
                 msg = (
                     f"🚨 *สัญญาณ SELL (Short) - TF {tf.upper()}*\n"
@@ -92,7 +105,7 @@ def check_market():
                 last_alert_time[tf] = current_time
                 continue
 
-            # เงื่อนไข BUY: ราคาชนแนวรับ + Stoch <= 20 พร้อมกัน
+            # เงื่อนไข BUY
             if current_low <= sup_level and k_value <= 20:
                 msg = (
                     f"🟢 *สัญญาณ BUY (Long) - TF {tf.upper()}*\n"
@@ -109,7 +122,7 @@ def check_market():
             print(f"เกิดข้อผิดพลาดใน TF {tf}: {e}")
 
 if __name__ == "__main__":
-    print("🤖 บอท XAUUSD (แยก 1H/4H + เงื่อนไขพร้อมกัน) เริ่มทำงานแล้ว...")
+    print("🤖 บอท XAUUSD (Pure Pandas) เริ่มทำงานแล้ว...")
     while True:
         check_market()
         time.sleep(900)
