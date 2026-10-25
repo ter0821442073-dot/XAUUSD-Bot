@@ -1,4 +1,6 @@
 requests
 pandas
+numpy<2.0
+numba==0.59.1
 pandas_ta
 yfinance
