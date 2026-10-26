@@ -12,7 +12,7 @@ TOKEN = "8696072748:AAGgKHI5ODOSZqldqETioZXKowULg8AjQ-c"
 CHAT_ID = "-5386954768"
 SHEET_ID = "10aE1bClTH6Ru1vu8rWZwA_yWg4EnMAnWJtdVeMrFYmo"
 
-# ใช้ GC=F (Gold Futures) ซึ่งเป็นสัญลักษณ์บน Yahoo ที่เสถียรที่สุด
+# ใช้ GC=F (Gold Futures) บน Yahoo ที่เสถียรที่สุด
 SYMBOL = "GC=F"
 
 last_alert_time = {"1h": None, "4h": None}
@@ -102,7 +102,6 @@ def check_market():
             res_level = levels[tf]["res"]
             sup_level = levels[tf]["sup"]
 
-            # ปริ้นท์โชว์ค่าราคาใน Logs เพื่อให้เทียบกับ MT5 ได้ทุกๆ 5 นาที
             print(f"[{tf.upper()}] ราคา High: {current_high:.2f} | Low: {current_low:.2f} | Stoch %K: {k_value:.2f}")
 
             if last_alert_time[tf] == current_time:
@@ -146,10 +145,6 @@ if __name__ == "__main__":
     t.start()
     
     print("🤖 บอท XAUUSD เริ่มทำงานแล้ว...")
-    
-    # 🧪 ส่งข้อความทดสอบเข้า Telegram ทันทีที่บอทเริ่มบูต
-    send_telegram_message("🤖 *ทดสอบระบบ*: บอท XAUUSD เชื่อมต่อสำเร็จและพร้อมทำงานแล้วครับ!")
-
     while True:
         check_market()
         # เช็กราคาและอินดิเคเตอร์ทุกๆ 5 นาที (300 วินาที)
