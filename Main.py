@@ -12,9 +12,9 @@ import yfinance as yf
 # ==========================================
 # ⚙️ ตั้งค่า (อ่านจาก Environment Variable บน Render)
 # ==========================================
-TOKEN = os.environ["8696072748:AAGgKHI5ODOSZqldqETioZXKowULg8AjQ-c"]
-CHAT_ID = os.environ["-5386954768"]
-SHEET_ID = os.environ["10aE1bClTH6Ru1vu8rWZwA_yWg4EnMAnWJtdVeMrFYmo"]
+TOKEN = os.environ["TG_TOKEN"]
+CHAT_ID = os.environ["TG_CHAT_ID"]
+SHEET_ID = os.environ["SHEET_ID"]
 
 SYMBOL = os.environ.get("SYMBOL", "GC=F")
 # ส่วนต่างราคา futures - spot (เช่น GC=F สูงกว่า MT5 อยู่ 12 จุด ใส่ 12)
