@@ -1,4 +1,4 @@
-import time
+สนามimport time
 import requests
 import pandas as pd
 import yfinance as yf
@@ -123,6 +123,29 @@ def check_market():
 
 if __name__ == "__main__":
     print("🤖 บอท XAUUSD (Pure Pandas) เริ่มทำงานแล้ว...")
+    while True:
+        check_market()
+        time.sleep(900)
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+def run_web():
+    server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
+    server.serve_forever()
+
+# รันเว็บเซิร์ฟเวอร์จำลองควบคู่ไปกับบอท
+if __name__ == "__main__":
+    t = threading.Thread(target=run_web)
+    t.daemon = True
+    t.start()
+
+    print("🤖 บอท XAUUSD เริ่มทำงานแล้ว...")
     while True:
         check_market()
         time.sleep(900)
