@@ -12,7 +12,7 @@ TOKEN = "8696072748:AAGgKHI5ODOSZqldqETioZXKowULg8AjQ-c"
 CHAT_ID = "-5386954768"
 SHEET_ID = "10aE1bClTH6Ru1vu8rWZwA_yWg4EnMAnWJtdVeMrFYmo"
 
-# เปลี่ยนมาใช้ราคา Spot ทองคำจริง (XAUUSD=X) ให้ตรงกับตลาดจริงมากขึ้น
+# ใช้ราคา Spot ทองคำจริง (XAUUSD=X) ให้ตรงกับตลาดจริงมากที่สุด
 SYMBOL = "XAUUSD=X"
 
 last_alert_time = {"1h": None, "4h": None}
@@ -94,15 +94,18 @@ def check_market():
                 continue
 
             stoch_k, _ = calculate_stoch(df)
-            current_time = str(df.index[-1])  # ใช้แท่งเทียนปัจจุบันเพื่อความรวดเร็ว
-            current_high = float(df['High'].iloc[-1])
-            current_low = float(df['Low'].iloc[-1])
-            k_value = float(stoch_k.iloc[-1])
+            current_time = str(df.index[-1])
+            
+            # ดึงค่าแบบแปลงเป็น float เพื่อป้องกันปัญหาข้อมูลของ Series/DataFrame
+            current_high = float(df['High'].iloc[-1].item() if hasattr(df['High'].iloc[-1], 'item') else df['High'].iloc[-1])
+            current_low = float(df['Low'].iloc[-1].item() if hasattr(df['Low'].iloc[-1], 'item') else df['Low'].iloc[-1])
+            k_value = float(stoch_k.iloc[-1].item() if hasattr(stoch_k.iloc[-1], 'item') else stoch_k.iloc[-1])
 
             res_level = levels[tf]["res"]
             sup_level = levels[tf]["sup"]
 
-            print(f"[{tf.upper()}] High: {current_high:.2f} | Low: {current_low:.2f} | Stoch: {k_value:.2f}")
+            # แสดงผลราคาและอินดิเคเตอร์ออกทาง Logs ชัดเจนทุกรอบ
+            print(f"[{tf.upper()}] ราคา High: {current_high:.2f} | Low: {current_low:.2f} | Stoch %K: {k_value:.2f}")
 
             if last_alert_time[tf] == current_time:
                 continue
@@ -147,5 +150,5 @@ if __name__ == "__main__":
     print("🤖 บอท XAUUSD (Spot Realtime) เริ่มทำงานแล้ว...")
     while True:
         check_market()
-        # เปลี่ยนเวลาวนลูปเหลือทุกๆ 5 นาที (300 วินาที) เพื่อความรวดเร็วในการแจ้งเตือน
+        # เช็กราคาและอินดิเคเตอร์ทุกๆ 5 นาที (300 วินาที)
         time.sleep(300)
