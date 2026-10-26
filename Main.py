@@ -8,8 +8,8 @@ import yfinance as yf
 # ==========================================
 # ⚙️ ตั้งค่าการเชื่อมต่อ (เปลี่ยน Token ของจริงทีหลังได้)
 # ==========================================
-TOKEN = "YOUR_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+TOKEN = "8696072748:AAGgKHI5ODOSZqldqETioZXKowULg8AjQ-c"
+CHAT_ID = "-5386954768"
 SHEET_ID = "10aE1bClTH6Ru1vu8rWZwA_yWg4EnMAnWJtdVeMrFYmo"
 SYMBOL = "GC=F"
 
