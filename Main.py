@@ -6,12 +6,14 @@ import pandas as pd
 import yfinance as yf
 
 # ==========================================
-# ⚙️ ตั้งค่าการเชื่อมต่อ (เปลี่ยน Token ของจริงทีหลังได้)
+# ⚙️ ตั้งค่าการเชื่อมต่อ
 # ==========================================
 TOKEN = "8696072748:AAGgKHI5ODOSZqldqETioZXKowULg8AjQ-c"
 CHAT_ID = "-5386954768"
 SHEET_ID = "10aE1bClTH6Ru1vu8rWZwA_yWg4EnMAnWJtdVeMrFYmo"
-SYMBOL = "GC=F"
+
+# เปลี่ยนมาใช้ราคา Spot ทองคำจริง (XAUUSD=X) ให้ตรงกับตลาดจริงมากขึ้น
+SYMBOL = "XAUUSD=X"
 
 last_alert_time = {"1h": None, "4h": None}
 
@@ -24,7 +26,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"XAUUSD Bot is running!")
     def log_message(self, format, *args):
-        pass # ปิด Log HTTP ไม่ให้รกหน้าจอ
+        pass
 
 def run_web():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
@@ -86,15 +88,16 @@ def check_market():
 
     for tf in ["1h", "4h"]:
         try:
-            df = yf.download(SYMBOL, period="10d", interval=tf, progress=False)
+            # ดึงข้อมูลย้อนหลังพอประมาณสำหรับคำนวณอินดิเคเตอร์
+            df = yf.download(SYMBOL, period="5d", interval=tf, progress=False)
             if df.empty or len(df) < 20:
                 continue
 
             stoch_k, _ = calculate_stoch(df)
-            current_time = str(df.index[-2])
-            current_high = float(df['High'].iloc[-2])
-            current_low = float(df['Low'].iloc[-2])
-            k_value = float(stoch_k.iloc[-2])
+            current_time = str(df.index[-1])  # ใช้แท่งเทียนปัจจุบันเพื่อความรวดเร็ว
+            current_high = float(df['High'].iloc[-1])
+            current_low = float(df['Low'].iloc[-1])
+            k_value = float(stoch_k.iloc[-1])
 
             res_level = levels[tf]["res"]
             sup_level = levels[tf]["sup"]
@@ -108,7 +111,7 @@ def check_market():
             if current_high >= res_level and k_value >= 80:
                 msg = (
                     f"🚨 *สัญญาณ SELL (Short) - TF {tf.upper()}*\n"
-                    f"📊 คู่เงิน: `XAUUSD`\n"
+                    f"📊 คู่เงิน: `XAUUSD` (Spot)\n"
                     f"📈 High ชนต้าน: `{current_high:.2f}` (แนวต้าน: {res_level})\n"
                     f"📉 Stochastic %K: `{k_value:.2f}` (Overbought >= 80)\n"
                     f"📱 *เปิด MT5 เช็กกราฟแล้วลุยเลย!*"
@@ -121,7 +124,7 @@ def check_market():
             if current_low <= sup_level and k_value <= 20:
                 msg = (
                     f"🟢 *สัญญาณ BUY (Long) - TF {tf.upper()}*\n"
-                    f"📊 คู่เงิน: `XAUUSD`\n"
+                    f"📊 คู่เงิน: `XAUUSD` (Spot)\n"
                     f"📉 Low ชนรับ: `{current_low:.2f}` (แนวรับ: {sup_level})\n"
                     f"📈 Stochastic %K: `{k_value:.2f}` (Oversold <= 20)\n"
                     f"📱 *เปิด MT5 เช็กกราฟแล้วลุยเลย!*"
@@ -137,12 +140,12 @@ def check_market():
 # 🚀 จุดเริ่มต้นรันโปรแกรม
 # ==========================================
 if __name__ == "__main__":
-    # เปิดเว็บเซิร์ฟเวอร์ใน Thread แยก เพื่อผ่านพอร์ต Render
     t = threading.Thread(target=run_web)
     t.daemon = True
     t.start()
     
-    print("🤖 บอท XAUUSD เริ่มทำงานและเปิดพอร์ตเว็บเรียบร้อย...")
+    print("🤖 บอท XAUUSD (Spot Realtime) เริ่มทำงานแล้ว...")
     while True:
         check_market()
-        time.sleep(900)
+        # เปลี่ยนเวลาวนลูปเหลือทุกๆ 3 นาที (180 วินาที) เพื่อความรวดเร็วในการแจ้งเตือน
+        time.sleep(180)
