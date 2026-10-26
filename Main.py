@@ -12,7 +12,6 @@ TOKEN = "8696072748:AAGgKHI5ODOSZqldqETioZXKowULg8AjQ-c"
 CHAT_ID = "-5386954768"
 SHEET_ID = "10aE1bClTH6Ru1vu8rWZwA_yWg4EnMAnWJtdVeMrFYmo"
 
-# ใช้ GC=F (Gold Futures) บน Yahoo ที่เสถียรที่สุด
 SYMBOL = "GC=F"
 
 last_alert_time = {"1h": None, "4h": None}
@@ -78,7 +77,7 @@ def calculate_stoch(df, k_period=14, d_period=3, smooth_k=3):
     return stoch_k, stoch_d
 
 # ==========================================
-# 🔍 ตรวจสอบตลาด
+# 🔍 ตรวจสอบตลาด (เพิ่มเงื่อนไขแท่งคู่ เขียว/แดง)
 # ==========================================
 def check_market():
     global last_alert_time
@@ -95,38 +94,51 @@ def check_market():
             stoch_k, _ = calculate_stoch(df)
             current_time = str(df.index[-1])
             
-            current_high = float(df['High'].iloc[-1].item() if hasattr(df['High'].iloc[-1], 'item') else df['High'].iloc[-1])
-            current_low = float(df['Low'].iloc[-1].item() if hasattr(df['Low'].iloc[-1], 'item') else df['Low'].iloc[-1])
+            # ข้อมูลแท่งปัจจุบัน (Index -1)
+            curr_high = float(df['High'].iloc[-1].item() if hasattr(df['High'].iloc[-1], 'item') else df['High'].iloc[-1])
+            curr_low = float(df['Low'].iloc[-1].item() if hasattr(df['Low'].iloc[-1], 'item') else df['Low'].iloc[-1])
+            curr_open = float(df['Open'].iloc[-1].item() if hasattr(df['Open'].iloc[-1], 'item') else df['Open'].iloc[-1])
+            curr_close = float(df['Close'].iloc[-1].item() if hasattr(df['Close'].iloc[-1], 'item') else df['Close'].iloc[-1])
             k_value = float(stoch_k.iloc[-1].item() if hasattr(stoch_k.iloc[-1], 'item') else stoch_k.iloc[-1])
+
+            # ข้อมูลแท่งก่อนหน้า (Index -2) สำหรับเช็กสีแท่งคู่
+            prev_open = float(df['Open'].iloc[-2].item() if hasattr(df['Open'].iloc[-2], 'item') else df['Open'].iloc[-2])
+            prev_close = float(df['Close'].iloc[-2].item() if hasattr(df['Close'].iloc[-2], 'item') else df['Close'].iloc[-2])
 
             res_level = levels[tf]["res"]
             sup_level = levels[tf]["sup"]
 
-            print(f"[{tf.upper()}] ราคา High: {current_high:.2f} | Low: {current_low:.2f} | Stoch %K: {k_value:.2f}")
+            print(f"[{tf.upper()}] High: {curr_high:.2f} | Low: {curr_low:.2f} | Stoch: {k_value:.2f}")
 
             if last_alert_time[tf] == current_time:
                 continue
 
-            # เงื่อนไข SELL
-            if current_high >= res_level and k_value >= 80:
+            # เช็กสถานะสีแท่งเทียน
+            is_prev_green = prev_close > prev_open
+            is_prev_red = prev_close < prev_open
+            is_curr_green = curr_close > curr_open
+            is_curr_red = curr_close < curr_open
+
+            # 🚨 เงื่อนไข SELL: ชนต้าน + Stoch >= 80 + แท่งคู่ (เขียว แล้วต่อด้วย แดง)
+            if curr_high >= res_level and k_value >= 80 and is_prev_green and is_curr_red:
                 msg = (
-                    f"🚨 *สัญญาณ SELL (Short) - TF {tf.upper()}*\n"
+                    f"🚨 *สัญญาณ SELL (แท่งคู่กลับตัว) - TF {tf.upper()}*\n"
                     f"📊 คู่เงิน: `XAUUSD` (Spot/GC)\n"
-                    f"📈 High ชนต้าน: `{current_high:.2f}` (แนวต้าน: {res_level})\n"
-                    f"📉 Stochastic %K: `{k_value:.2f}` (Overbought >= 80)\n"
+                    f"📈 High ชนต้าน: `{curr_high:.2f}` (แนวต้าน: {res_level})\n"
+                    f"📉 แท่งคู่: เขียว ➡️ แดง (Stoch %K: `{k_value:.2f}`)\n"
                     f"📱 *เปิด MT5 เช็กกราฟแล้วลุยเลย!*"
                 )
                 send_telegram_message(msg)
                 last_alert_time[tf] = current_time
                 continue
 
-            # เงื่อนไข BUY
-            if current_low <= sup_level and k_value <= 20:
+            # 🟢 เงื่อนไข BUY: ชนรับ + Stoch <= 20 + แท่งคู่ (แดง แล้วต่อด้วย เขียว)
+            if curr_low <= sup_level and k_value <= 20 and is_prev_red and is_curr_green:
                 msg = (
-                    f"🟢 *สัญญาณ BUY (Long) - TF {tf.upper()}*\n"
+                    f"🟢 *สัญญาณ BUY (แท่งคู่กลับตัว) - TF {tf.upper()}*\n"
                     f"📊 คู่เงิน: `XAUUSD` (Spot/GC)\n"
-                    f"📉 Low ชนรับ: `{current_low:.2f}` (แนวรับ: {sup_level})\n"
-                    f"📈 Stochastic %K: `{k_value:.2f}` (Oversold <= 20)\n"
+                    f"📉 Low ชนรับ: `{curr_low:.2f}` (แนวรับ: {sup_level})\n"
+                    f"📈 แท่งคู่: แดง ➡️ เขียว (Stoch %K: `{k_value:.2f}`)\n"
                     f"📱 *เปิด MT5 เช็กกราฟแล้วลุยเลย!*"
                 )
                 send_telegram_message(msg)
@@ -147,5 +159,4 @@ if __name__ == "__main__":
     print("🤖 บอท XAUUSD เริ่มทำงานแล้ว...")
     while True:
         check_market()
-        # เช็กราคาและอินดิเคเตอร์ทุกๆ 5 นาที (300 วินาที)
         time.sleep(300)
