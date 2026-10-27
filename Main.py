@@ -146,8 +146,8 @@ def fire(key, bar_id, msg):
     return False
 
 
-def cooldown_ok(tf, side, bar_start, delta):
-    last = sent.get(f"{tf}:cd_{side}")
+def cooldown_ok(tf, side, level, bar_start, delta):
+    last = sent.get(f"{tf}:cd_{side}:{level:.2f}")
     if not last:
         return True
     try:
@@ -157,10 +157,11 @@ def cooldown_ok(tf, side, bar_start, delta):
     return gap >= COOLDOWN_BARS[tf]
 
 
-def mark_cooldown(tf, side, bar_start):
+def mark_cooldown(tf, side, level, bar_start):
     opp = "buy" if side == "sell" else "sell"
-    sent[f"{tf}:cd_{side}"] = str(bar_start)
-    sent.pop(f"{tf}:cd_{opp}", None)  # เปลี่ยนทิศ = ปลดล็อกฝั่งตรงข้าม
+    sent[f"{tf}:cd_{side}:{level:.2f}"] = str(bar_start)
+    for k in [k for k in sent if k.startswith(f"{tf}:cd_{opp}")]:
+        sent.pop(k, None)  # เปลี่ยนทิศ = ปลดล็อกฝั่งตรงข้าม
     save_state()
 
 # ==========================================
@@ -177,13 +178,21 @@ def parse_news(df):
     return out
 
 
+def read_levels(df, col):
+    """อ่านทุกช่องที่มีตัวเลขในคอลัมน์ (แถว 2 ลงไป) = หลายแนว"""
+    vals = pd.to_numeric(df[col].astype(str).str.replace(",", ""), errors="coerce").dropna()
+    if vals.empty:
+        raise ValueError(f"คอลัมน์ {col} ไม่มีตัวเลข")
+    return sorted(float(v) for v in vals)
+
+
 def get_levels_from_google_sheet():
     try:
         url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv"
         df = pd.read_csv(url)
         return {
-            "1h": {"res": float(df["1H_Res"].iloc[0]), "sup": float(df["1H_Sup"].iloc[0])},
-            "4h": {"res": float(df["4H_Res"].iloc[0]), "sup": float(df["4H_Sup"].iloc[0])},
+            "1h": {"res": read_levels(df, "1H_Res"), "sup": read_levels(df, "1H_Sup")},
+            "4h": {"res": read_levels(df, "4H_Res"), "sup": read_levels(df, "4H_Sup")},
             "news": parse_news(df),
         }
     except Exception as e:
@@ -290,10 +299,12 @@ def sl_tp_text(side, entry, atr_val, target):
         return ""
     risk = ATR_MULT * atr_val
     if side == "sell":
-        sl, reward, tp_ok = entry + risk, entry - target, target < entry
+        sl = entry + risk
+        reward, tp_ok = (entry - target, True) if target is not None else (0, False)
         tp_name = "แนวรับ"
     else:
-        sl, reward, tp_ok = entry - risk, target - entry, target > entry
+        sl = entry - risk
+        reward, tp_ok = (target - entry, True) if target is not None else (0, False)
         tp_name = "แนวต้าน"
     text = f"🛑 SL ({ATR_MULT:g}×ATR {atr_val:.2f}): <code>{px(sl):.2f}</code>"
     if tp_ok and risk > 0:
@@ -342,6 +353,21 @@ def is_market_open():
 # ==========================================
 # 🔔 ตรวจสัญญาณ
 # ==========================================
+def next_target(side, entry, sup_list, res_list):
+    """เป้าหมาย = แนวถัดไปในทิศที่ราคาจะไป (ขาย: แนวรับใต้ราคา / ซื้อ: แนวต้านเหนือราคา)"""
+    if side == "sell":
+        c = [s for s in sup_list if s < entry]
+        return max(c) if c else None
+    c = [r for r in res_list if r > entry]
+    return min(c) if c else None
+
+
+def pre_alerted(tf, side, bar_id):
+    """เคยเตือนทันทีฝั่งนี้ในแท่งนี้แล้วหรือไม่ (ไม่ว่าชนแนวไหน)"""
+    prefix = f"{tf}:live_{side}"
+    return any(k.startswith(prefix) and v == bar_id for k, v in sent.items())
+
+
 def check_timeframe(tf, df, levels, last_1h_start, k4_now):
     if len(df) < 25:
         return
@@ -363,13 +389,14 @@ def check_timeframe(tf, df, levels, last_1h_start, k4_now):
     cl_i = -2 if is_live else -1
     pv_i = cl_i - 1
 
-    res = levels[tf]["res"] + PRICE_OFFSET
-    sup = levels[tf]["sup"] + PRICE_OFFSET
+    res_list = [v + PRICE_OFFSET for v in levels[tf]["res"]]
+    sup_list = [v + PRICE_OFFSET for v in levels[tf]["sup"]]
     tf_u = tf.upper()
     atr_val = float(atr.iloc[cl_i])
     risk = risk_notes(levels.get("news", []))
 
-    print(f"[{tf_u}] แนวต้าน {res:.2f} | แนวรับ {sup:.2f} (ระดับ GC=F รวม offset {PRICE_OFFSET:g}) | แท่งสด={is_live}")
+    print(f"[{tf_u}] แนวต้าน {[round(v, 2) for v in res_list]} | แนวรับ {[round(v, 2) for v in sup_list]} "
+          f"(ระดับ GC=F รวม offset {PRICE_OFFSET:g}) | แท่งสด={is_live}")
 
     if SKIP_RISK_WINDOWS and risk:
         print(f"[{tf_u}] ข้ามรอบนี้ (ช่วงเสี่ยง): {' / '.join(risk)}")
@@ -390,37 +417,38 @@ def check_timeframe(tf, df, levels, last_1h_start, k4_now):
 
         for side in ("sell", "buy"):
             if side == "sell":
-                touched = l_high >= res
+                hit = [r for r in res_list if l_high >= r]
+                level = max(hit) if hit else None   # แนวต้านสูงสุดที่ชนแล้ว
                 stoch_ok = (not need_stoch) or (not pd.isna(k_live) and k_live >= 80)
             else:
-                touched = l_low <= sup
+                hit = [s for s in sup_list if l_low <= s]
+                level = min(hit) if hit else None   # แนวรับต่ำสุดที่ชนแล้ว
                 stoch_ok = (not need_stoch) or (not pd.isna(k_live) and k_live <= 20)
-            if not (touched and stoch_ok):
+            if level is None or not stoch_ok:
                 continue
-            if not cooldown_ok(tf, side, df.index[live_i], delta):
+            if not cooldown_ok(tf, side, level, df.index[live_i], delta):
                 continue
             zone_txt, zone_ok = zone_label(side, k4_now) if tf == "1h" else ("", True)
             if H4_ZONE_FILTER and not zone_ok:
                 continue
 
+            target = next_target(side, l_close, sup_list, res_list)
             if side == "sell":
                 title = f"⚡ <b>เตือนทันที SELL (ชนแนวต้าน{stoch_part}) - TF {tf_u}</b>"
                 lines = [
-                    f"📈 High: <code>{px(l_high):.2f}</code> ชนแนวต้าน <code>{px(res):.2f}</code>",
+                    f"📈 High: <code>{px(l_high):.2f}</code> ชนแนวต้าน <code>{px(level):.2f}</code>",
                     f"💵 ราคาตอนนี้: <code>{px(l_close):.2f}</code> | Stoch %K: <code>{k_txt}</code>",
                 ]
-                target = sup
             else:
                 title = f"⚡ <b>เตือนทันที BUY (ชนแนวรับ{stoch_part}) - TF {tf_u}</b>"
                 lines = [
-                    f"📉 Low: <code>{px(l_low):.2f}</code> ชนแนวรับ <code>{px(sup):.2f}</code>",
+                    f"📉 Low: <code>{px(l_low):.2f}</code> ชนแนวรับ <code>{px(level):.2f}</code>",
                     f"💵 ราคาตอนนี้: <code>{px(l_close):.2f}</code> | Stoch %K: <code>{k_txt}</code>",
                 ]
-                target = res
 
             msg = compose(title, llabel, lines, side, l_close, atr_val, target, zone_txt, risk, note)
-            if fire(f"{tf}:live_{side}", lid, msg):
-                mark_cooldown(tf, side, df.index[live_i])
+            if fire(f"{tf}:live_{side}:{level:.2f}", lid, msg):
+                mark_cooldown(tf, side, level, df.index[live_i])
 
     # ---------- แท่งที่ปิดแล้ว: ยืนยันแท่งคู่ / Stoch ตัดกลับ ----------
     if len(df) < abs(pv_i):
@@ -434,9 +462,14 @@ def check_timeframe(tf, df, levels, last_1h_start, k4_now):
     cid = str(df.index[cl_i])
     clabel = fmt(df.index[cl_i])
 
+    sell_hit = [r for r in res_list if c_high >= r]
+    buy_hit = [s for s in sup_list if c_low <= s]
+    sell_level = max(sell_hit) if sell_hit else None
+    buy_level = min(buy_hit) if buy_hit else None
+
     # ถ้าเคยเตือนทันที (1H) ในแท่งนี้แล้ว ถือว่าชนแนว + Stoch เกิดขึ้นแล้ว
-    sell_pre_alerted = tf == "1h" and sent.get("1h:live_sell") == cid
-    buy_pre_alerted = tf == "1h" and sent.get("1h:live_buy") == cid
+    sell_pre_alerted = tf == "1h" and pre_alerted(tf, "sell", cid)
+    buy_pre_alerted = tf == "1h" and pre_alerted(tf, "buy", cid)
 
     sell_pat = reversal_pattern("sell", p_open, p_close, c_open, c_high, c_low, c_close)
     buy_pat = reversal_pattern("buy", p_open, p_close, c_open, c_high, c_low, c_close)
@@ -448,15 +481,16 @@ def check_timeframe(tf, df, levels, last_1h_start, k4_now):
 
     print(f"[{tf_u}] ปิด {clabel} H:{c_high:.2f} L:{c_low:.2f} C:{c_close:.2f} | %K {k_c:.1f} (ก่อนหน้า {k_p:.1f}) | ATR {atr_val:.2f}")
 
-    if c_high >= res and (k_c >= 80 or sell_pre_alerted) and sell_pat and sell_zone_ok:
+    if sell_level is not None and (k_c >= 80 or sell_pre_alerted) and sell_pat and sell_zone_ok:
         lines = [
-            f"📈 High: <code>{px(c_high):.2f}</code> ชนแนวต้าน <code>{px(res):.2f}</code>",
-            f"💵 ราคาปิด: <code>{px(c_close):.2f}</code> (ห่างแนวต้าน {res - c_close:.2f})",
+            f"📈 High: <code>{px(c_high):.2f}</code> ชนแนวต้าน <code>{px(sell_level):.2f}</code>",
+            f"💵 ราคาปิด: <code>{px(c_close):.2f}</code> (ห่างแนวต้าน {sell_level - c_close:.2f})",
             f"📉 แท่งคู่: เขียว ➡️ แดง ({sell_pat}) | Stoch %K: <code>{k_c:.2f}</code>",
         ]
         fire(f"{tf}:close_sell", cid,
              compose(f"🚨 <b>ยืนยัน SELL (ชนแนวต้าน + Stoch + ปิดแท่งคู่) - TF {tf_u}</b>",
-                     clabel, lines, "sell", c_close, atr_val, sup, z_sell_txt, risk))
+                     clabel, lines, "sell", c_close, atr_val,
+                     next_target("sell", c_close, sup_list, res_list), z_sell_txt, risk))
     elif tf == "4h" and k_p >= 80 and k_c < 80:
         lines = [
             f"📉 %K: <code>{k_p:.1f}</code> ➡️ <code>{k_c:.1f}</code> (&lt; 80)",
@@ -464,16 +498,18 @@ def check_timeframe(tf, df, levels, last_1h_start, k4_now):
         ]
         fire("4h:cross_sell", cid,
              compose("🚨 <b>สัญญาณ SELL (Stoch ตัดกลับ) - TF 4H</b>",
-                     clabel, lines, "sell", c_close, atr_val, sup, "", risk))
-    elif c_low <= sup and (k_c <= 20 or buy_pre_alerted) and buy_pat and buy_zone_ok:
+                     clabel, lines, "sell", c_close, atr_val,
+                     next_target("sell", c_close, sup_list, res_list), "", risk))
+    elif buy_level is not None and (k_c <= 20 or buy_pre_alerted) and buy_pat and buy_zone_ok:
         lines = [
-            f"📉 Low: <code>{px(c_low):.2f}</code> ชนแนวรับ <code>{px(sup):.2f}</code>",
-            f"💵 ราคาปิด: <code>{px(c_close):.2f}</code> (ห่างแนวรับ {c_close - sup:.2f})",
+            f"📉 Low: <code>{px(c_low):.2f}</code> ชนแนวรับ <code>{px(buy_level):.2f}</code>",
+            f"💵 ราคาปิด: <code>{px(c_close):.2f}</code> (ห่างแนวรับ {c_close - buy_level:.2f})",
             f"📈 แท่งคู่: แดง ➡️ เขียว ({buy_pat}) | Stoch %K: <code>{k_c:.2f}</code>",
         ]
         fire(f"{tf}:close_buy", cid,
              compose(f"🟢 <b>ยืนยัน BUY (ชนแนวรับ + Stoch + ปิดแท่งคู่) - TF {tf_u}</b>",
-                     clabel, lines, "buy", c_close, atr_val, res, z_buy_txt, risk))
+                     clabel, lines, "buy", c_close, atr_val,
+                     next_target("buy", c_close, sup_list, res_list), z_buy_txt, risk))
     elif tf == "4h" and k_p <= 20 and k_c > 20:
         lines = [
             f"📈 %K: <code>{k_p:.1f}</code> ➡️ <code>{k_c:.1f}</code> (&gt; 20)",
@@ -481,7 +517,8 @@ def check_timeframe(tf, df, levels, last_1h_start, k4_now):
         ]
         fire("4h:cross_buy", cid,
              compose("🟢 <b>สัญญาณ BUY (Stoch ตัดกลับ) - TF 4H</b>",
-                     clabel, lines, "buy", c_close, atr_val, res, "", risk))
+                     clabel, lines, "buy", c_close, atr_val,
+                     next_target("buy", c_close, sup_list, res_list), "", risk))
 
 # ==========================================
 # 🔍 วนตรวจตลาด
