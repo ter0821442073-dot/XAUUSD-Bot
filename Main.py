@@ -27,8 +27,11 @@ SYMBOL = os.environ.get("SYMBOL", "GC=F")
 # ส่วนต่างราคา futures - spot (GC=F สูงกว่า MT5 12 จุด ใส่ 12) ข้อความแจ้งเตือนจะแสดงเป็นราคาระดับ MT5
 PRICE_OFFSET = float(os.environ.get("PRICE_OFFSET", "0"))
 
-# เวลา MT5 (โบรกแบบ NY close) = เวลานิวยอร์ก + 7 ชม.
+# เวลา MT5 = UTC + SERVER_UTC_OFFSET_HOURS (ค่าคงที่ ไม่เปลี่ยนตาม DST) ค่าเริ่มต้น 0 = GMT+0
+# ถ้าโบรกเป็นแบบ NY close (GMT+2/+3 ตาม DST) ให้ตั้งค่านี้เป็นค่าว่าง แล้วใช้ SERVER_SHIFT_HOURS (NY + 7) แทน
 NY_TZ = "America/New_York"
+_utc_off = os.environ.get("SERVER_UTC_OFFSET_HOURS", "0").strip()
+SERVER_UTC_OFFSET_HOURS = float(_utc_off) if _utc_off != "" else None
 SERVER_SHIFT_HOURS = int(os.environ.get("SERVER_SHIFT_HOURS", "7"))
 H4_OFFSET_HOURS = int(os.environ.get("H4_OFFSET_HOURS", "0"))
 H4_LIVE_REQUIRE_STOCH = os.environ.get("H4_LIVE_REQUIRE_STOCH", "0") == "1"
@@ -57,9 +60,9 @@ H4_ZONE_FILTER = os.environ.get("H4_ZONE_FILTER", "0") == "1"
 ATR_PERIOD = int(os.environ.get("ATR_PERIOD", "14"))
 ATR_MULT = float(os.environ.get("ATR_MULT", "1.5"))
 
-# 6) ช่วงเสี่ยง (เวลา MT5): รอยต่อวัน 23:00-01:00 + เวลาข่าวจากคอลัมน์ "News" ในชีต
-ROLLOVER_START = int(os.environ.get("ROLLOVER_START", "23"))
-ROLLOVER_END = int(os.environ.get("ROLLOVER_END", "1"))
+# 6) ช่วงเสี่ยง: รอยต่อวันตลาดทอง (16:00-18:00 เวลานิวยอร์ก ไม่ขึ้นกับเวลา MT5) + เวลาข่าวจากคอลัมน์ "News" ในชีต (เวลา MT5)
+ROLLOVER_START = int(os.environ.get("ROLLOVER_START", "16"))
+ROLLOVER_END = int(os.environ.get("ROLLOVER_END", "18"))
 NEWS_BEFORE_MIN = int(os.environ.get("NEWS_BEFORE_MIN", "30"))
 NEWS_AFTER_MIN = int(os.environ.get("NEWS_AFTER_MIN", "30"))
 SKIP_RISK_WINDOWS = os.environ.get("SKIP_RISK_WINDOWS", "0") == "1"  # 1 = ไม่ส่งสัญญาณช่วงเสี่ยง
@@ -203,8 +206,19 @@ def get_levels_from_google_sheet():
 # 🕒 เวลา MT5
 # ==========================================
 def now_server():
+    if SERVER_UTC_OFFSET_HOURS is not None:
+        utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        return pd.Timestamp(utc + timedelta(hours=SERVER_UTC_OFFSET_HOURS))
     ny = datetime.now(timezone.utc).astimezone(ZoneInfo(NY_TZ)).replace(tzinfo=None)
     return pd.Timestamp(ny + timedelta(hours=SERVER_SHIFT_HOURS))
+
+
+def to_server_index(idx):
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    if SERVER_UTC_OFFSET_HOURS is not None:
+        return idx.tz_convert("UTC").tz_localize(None) + pd.Timedelta(hours=SERVER_UTC_OFFSET_HOURS)
+    return idx.tz_convert(NY_TZ).tz_localize(None) + pd.Timedelta(hours=SERVER_SHIFT_HOURS)
 
 
 def fmt(ts):
@@ -226,10 +240,7 @@ def fetch_1h():
         df.columns = df.columns.get_level_values(0)
     df = df[["Open", "High", "Low", "Close"]].dropna()
 
-    idx = df.index
-    if idx.tz is None:
-        idx = idx.tz_localize("UTC")
-    df.index = idx.tz_convert(NY_TZ).tz_localize(None) + pd.Timedelta(hours=SERVER_SHIFT_HOURS)
+    df.index = to_server_index(df.index)
     return df[~df.index.duplicated(keep="last")]
 
 
@@ -315,7 +326,8 @@ def sl_tp_text(side, entry, atr_val, target):
 def risk_notes(news_times):
     notes = []
     now = now_server()
-    if now.hour >= ROLLOVER_START or now.hour < ROLLOVER_END:
+    ny_hour = datetime.now(timezone.utc).astimezone(ZoneInfo(NY_TZ)).hour
+    if ROLLOVER_START <= ny_hour < ROLLOVER_END:
         notes.append("⚠️ ช่วงรอยต่อวัน สเปรดกว้าง")
     for t in news_times:
         if t - timedelta(minutes=NEWS_BEFORE_MIN) <= now <= t + timedelta(minutes=NEWS_AFTER_MIN):
@@ -596,7 +608,7 @@ if __name__ == "__main__":
     print("🤖 บอท XAUUSD เริ่มทำงานแล้ว...")
     send_telegram_message(
         f"🚀 <b>บอท XAUUSD เริ่มทำงานแล้ว</b>\n🕒 เวลา MT5 ตอนนี้: <code>{fmt(now_server())}</code>\n"
-        f"(ถ้าไม่ตรงกับนาฬิกาใน MT5 ให้ปรับ SERVER_SHIFT_HOURS)"
+        f"(ถ้าไม่ตรงกับนาฬิกาใน MT5 ให้ปรับ SERVER_UTC_OFFSET_HOURS)"
     )
 
     while True:
