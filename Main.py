@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 import json
@@ -95,6 +96,8 @@ def save_state():
 
 sent = load_state()  # "1h:live_sell" -> id แท่งที่แจ้งแล้ว / "1h:cd_sell" -> แท่งที่เตือนทันทีล่าสุด
 last_heartbeat_time = time.time()
+last_cycle_time = time.time()
+WATCHDOG_SEC = int(os.environ.get("WATCHDOG_SEC", "600"))
 sheet_errors = 0
 data_errors = 0
 sheet_alerted = False
@@ -145,7 +148,9 @@ def fire(key, bar_id, msg):
     if send_telegram_message(msg):
         sent[key] = bar_id
         save_state()
+        print(f"✅ ส่งแจ้งเตือนแล้ว: {key}")
         return True
+    print(f"❌ ส่งแจ้งเตือนไม่สำเร็จ: {key}")
     return False
 
 
@@ -192,7 +197,9 @@ def read_levels(df, col):
 def get_levels_from_google_sheet():
     try:
         url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv"
-        df = pd.read_csv(url)
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
         return {
             "1h": {"res": read_levels(df, "1H_Res"), "sup": read_levels(df, "1H_Sup")},
             "4h": {"res": read_levels(df, "4H_Res"), "sup": read_levels(df, "4H_Sup")},
@@ -233,7 +240,7 @@ def px(v):
 # 📈 ข้อมูลราคา + อินดิเคเตอร์
 # ==========================================
 def fetch_1h():
-    df = yf.download(SYMBOL, period="30d", interval="1h", progress=False, auto_adjust=False)
+    df = yf.download(SYMBOL, period="30d", interval="1h", progress=False, auto_adjust=False, timeout=20)
     if df is None or df.empty:
         return None
     if isinstance(df.columns, pd.MultiIndex):
@@ -436,9 +443,11 @@ def check_timeframe(tf, df, levels, last_1h_start, k4_now):
                 hit = [s for s in sup_list if l_low <= s]
                 level = min(hit) if hit else None   # แนวรับต่ำสุดที่ชนแล้ว
                 stoch_ok = (not need_stoch) or (not pd.isna(k_live) and k_live <= 20)
-            if level is None or not stoch_ok:
+            if level is None:
                 continue
-            if not cooldown_ok(tf, side, level, df.index[live_i], delta):
+            cd_ok = cooldown_ok(tf, side, level, df.index[live_i], delta)
+            print(f"[{tf_u}] {side}: ชนแนว {level:.2f} | Stoch ผ่าน={stoch_ok} | พ้น cooldown={cd_ok}")
+            if not stoch_ok or not cd_ok:
                 continue
             zone_txt, zone_ok = zone_label(side, k4_now) if tf == "1h" else ("", True)
             if H4_ZONE_FILTER and not zone_ok:
@@ -600,10 +609,22 @@ def check_market():
             print(f"Error in TF {tf}: {e}")
 
 # ==========================================
+# 🐶 Watchdog: ถ้าลูปหลักค้างเกิน WATCHDOG_SEC วินาที ให้ปิดโปรเซส Render จะสตาร์ทใหม่ให้เอง
+# ==========================================
+def watchdog():
+    while True:
+        time.sleep(30)
+        if time.time() - last_cycle_time > WATCHDOG_SEC:
+            print("🐶 watchdog: ลูปหลักค้าง กำลังรีสตาร์ท")
+            send_telegram_message("⚠️ <b>บอทค้างเกินกำหนด กำลังรีสตาร์ทอัตโนมัติ</b>")
+            os._exit(1)
+
+# ==========================================
 # 🚀 เริ่มโปรแกรม
 # ==========================================
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
+    threading.Thread(target=watchdog, daemon=True).start()
 
     print("🤖 บอท XAUUSD เริ่มทำงานแล้ว...")
     send_telegram_message(
@@ -612,8 +633,10 @@ if __name__ == "__main__":
     )
 
     while True:
+        print(f"🔄 รอบตรวจ เวลา MT5 {fmt(now_server())}")
         try:
             check_market()
         except Exception as e:
             print(f"Unhandled error: {e}")
+        last_cycle_time = time.time()
         time.sleep(CHECK_INTERVAL)
