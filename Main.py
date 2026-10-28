@@ -655,7 +655,7 @@ def parse_trades(df):
 
 
 def evaluate_trade(t, bars):
-    """คืนสถานะไม้: closed (win/loss/be + R + จุดราคา) / open / unknown (เก่าเกินข้อมูล)"""
+    """คืนสถานะไม้: closed (win/loss/be + R) / open / unknown (เก่าเกินข้อมูล)"""
     risk = abs(t["entry"] - t["sl"])
     planned = abs(t["tp"] - t["entry"]) / risk
     base = {"id": t["id"], "side": t["side"], "planned_rr": planned, "time": t["time"]}
@@ -664,7 +664,7 @@ def evaluate_trade(t, bars):
         diff = (t["exit"] - t["entry"]) if t["side"] == "buy" else (t["entry"] - t["exit"])
         r = diff / risk
         res = "win" if r > BE_R else "loss" if r < -BE_R else "be"
-        return {**base, "status": "closed", "how": "manual", "result": res, "r": r, "pts": diff,
+        return {**base, "status": "closed", "how": "manual", "result": res, "r": r,
                 "close_time": t["exit_time"] or t["time"], "ambiguous": False}
 
     if bars is None or bars.empty or t["time"] < bars.index[0]:
@@ -686,10 +686,9 @@ def evaluate_trade(t, bars):
     first = any_hit.idxmax()
     sl_hit, tp_hit = bool(hit_sl.loc[first]), bool(hit_tp.loc[first])
     if sl_hit:  # ถ้า SL และ TP อยู่ในแท่ง 5 นาทีเดียวกัน นับเป็นแพ้ (ระมัดระวังไว้ก่อน)
-        return {**base, "status": "closed", "how": "sl", "result": "loss", "r": -1.0, "pts": -risk,
+        return {**base, "status": "closed", "how": "sl", "result": "loss", "r": -1.0,
                 "close_time": first, "ambiguous": tp_hit}
     return {**base, "status": "closed", "how": "tp", "result": "win", "r": planned,
-            "pts": abs(t["tp"] - t["entry"]),
             "close_time": first, "ambiguous": False}
 
 
@@ -699,20 +698,13 @@ def summarize(results):
     w = sum(1 for r in closed if r["result"] == "win")
     l = sum(1 for r in closed if r["result"] == "loss")
     sum_r = sum(r["r"] for r in closed)
-    sum_pts = sum(r.get("pts", 0.0) for r in closed)
     return {
         "n": n, "w": w, "l": l, "be": n - w - l,
         "wr": (w / n * 100) if n else 0.0,
         "sum_r": sum_r,
         "avg_r": (sum_r / n) if n else 0.0,
-        "sum_pts": sum_pts,
         "planned": (sum(r["planned_rr"] for r in closed) / n) if n else 0.0,
     }
-
-
-def pts_line(label, pts):
-    """บรรทัดกำไร/ขาดทุนเป็นจุดราคา (🟢 กำไร / 🔴 ขาดทุน)"""
-    return f"{'🟢' if pts >= 0 else '🔴'} {label}: <b>{pts:+.2f}</b> จุดราคา"
 
 
 def build_weekly_msg(start_s, end_s, week_res, all_res):
@@ -729,7 +721,6 @@ def build_weekly_msg(start_s, end_s, week_res, all_res):
             f"🎯 Win rate: <b>{ws['wr']:.0f}%</b>",
             f"📐 RR ที่วางไว้เฉลี่ย: 1:{ws['planned']:.2f}",
             f"💰 เฉลี่ยต่อไม้: <b>{ws['avg_r']:+.2f}R</b> | รวม {ws['sum_r']:+.2f}R",
-            pts_line("กำไร/ขาดทุนรวม", ws["sum_pts"]),
         ]
     else:
         lines.append("📌 สัปดาห์นี้ไม่มีไม้ที่ปิด")
@@ -741,7 +732,6 @@ def build_weekly_msg(start_s, end_s, week_res, all_res):
             "",
             f"📚 สะสมทั้งหมด ({al['n']} ไม้): ชนะ {al['w']} แพ้ {al['l']} เสมอ {al['be']}",
             f"🎯 Win rate {al['wr']:.0f}% | เฉลี่ย {al['avg_r']:+.2f}R/ไม้ | รวม {al['sum_r']:+.2f}R",
-            pts_line("กำไร/ขาดทุนสะสม", al["sum_pts"]),
         ]
     open_n = sum(1 for r in all_res if r["status"] == "open")
     unknown_n = sum(1 for r in all_res if r["status"] == "unknown")
@@ -760,9 +750,9 @@ WEEKLY_WINDOW_HOURS = int(os.environ.get("WEEKLY_WINDOW_HOURS", "12"))   # ส�
 def trade_alert_msg(t, r):
     side_u = "BUY" if t["side"] == "buy" else "SELL"
     if r["how"] == "tp":
-        title, tail = f"🎯 <b>TP ชน - {side_u}</b>", f"✅ ชนะ <b>{r['r']:+.2f}R</b> ({r['pts']:+.2f} จุดราคา)"
+        title, tail = f"🎯 <b>TP ชน - {side_u}</b>", f"✅ ชนะ <b>{r['r']:+.2f}R</b>"
     else:
-        title, tail = f"🛑 <b>SL ชน - {side_u}</b>", f"❌ แพ้ <b>-1.00R</b> ({r['pts']:+.2f} จุดราคา)"
+        title, tail = f"🛑 <b>SL ชน - {side_u}</b>", "❌ แพ้ <b>-1.00R</b>"
         if r.get("ambiguous"):
             tail += "\n⚠️ แท่งเดียวกันชนทั้ง SL และ TP นับเป็นแพ้"
     return "\n".join([
@@ -801,8 +791,7 @@ def tally_text(results, ts):
     if not s["n"]:
         return ""
     return (f"\n\n📈 สถิติวันที่ {start:%d/%m} (รวมไม้นี้): ชนะ {s['w']} | แพ้ {s['l']} | เสมอ {s['be']}\n"
-            f"🎯 Win rate {s['wr']:.0f}% | เฉลี่ย {s['avg_r']:+.2f}R/ไม้ | รวม {s['sum_r']:+.2f}R\n"
-            f"{pts_line('กำไร/ขาดทุนรวม', s['sum_pts'])}")
+            f"🎯 Win rate {s['wr']:.0f}% | เฉลี่ย {s['avg_r']:+.2f}R/ไม้ | รวม {s['sum_r']:+.2f}R")
 
 
 def collect_results(trades, bars_needed_days=MONITOR_DAYS):
@@ -851,7 +840,6 @@ def build_daily_msg(day_start, day_res, open_n):
         f"🎯 Win rate: <b>{s['wr']:.0f}%</b>",
         f"📐 RR ที่วางไว้เฉลี่ย: 1:{s['planned']:.2f}",
         f"💰 เฉลี่ยต่อไม้: <b>{s['avg_r']:+.2f}R</b> | รวม {s['sum_r']:+.2f}R",
-        pts_line("กำไร/ขาดทุนรวม", s["sum_pts"]),
     ]
     if open_n:
         lines.append(f"⏳ ไม้ที่ยังเปิดอยู่: {open_n}")
