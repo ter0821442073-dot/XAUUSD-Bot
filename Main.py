@@ -371,13 +371,14 @@ def compose(title, label, lines, side, entry, atr_val, target, zone_txt, risk, n
 # 🕒 ตลาดเปิดหรือไม่
 # ==========================================
 def is_market_open():
-    now = datetime.now(timezone.utc)
-    wd, hr = now.weekday(), now.hour
+    """ทองปิดศุกร์ 17:00 - เปิดอาทิตย์ 18:00 เวลานิวยอร์ก (อิงเวลานิวยอร์กจริง รวม DST)"""
+    ny = datetime.now(timezone.utc).astimezone(ZoneInfo(NY_TZ))
+    wd, hr = ny.weekday(), ny.hour
     if wd == 5:
         return False
-    if wd == 4 and hr >= 22:
+    if wd == 4 and hr >= 17:
         return False
-    if wd == 6 and hr < 22:
+    if wd == 6 and hr < 18:
         return False
     return True
 
@@ -709,13 +710,13 @@ def summarize(results):
 def build_weekly_msg(start_s, end_s, week_res, all_res):
     ws, al = summarize(week_res), summarize(all_res)
     lines = [
-        "📊 <b>สรุปผลเทรดรายสัปดาห์</b>",
+        "📊 <b>สรุปผลเทรดประจำสัปดาห์ (ตลาดปิดแล้ว)</b>",
         f"🗓 {fmt(start_s)} → {fmt(end_s)} (เวลา MT5)",
         "",
     ]
     if ws["n"]:
         lines += [
-            f"📌 ไม้ที่ปิดในสัปดาห์นี้: <b>{ws['n']}</b> ไม้",
+            f"📌 ไม้ที่ปิดทั้งสัปดาห์: <b>{ws['n']}</b> ไม้",
             f"✅ ชนะ {ws['w']} | ❌ แพ้ {ws['l']} | ➖ เสมอ {ws['be']}",
             f"🎯 Win rate: <b>{ws['wr']:.0f}%</b>",
             f"📐 RR ที่วางไว้เฉลี่ย: 1:{ws['planned']:.2f}",
@@ -739,6 +740,11 @@ def build_weekly_msg(start_s, end_s, week_res, all_res):
     if unknown_n:
         lines.append(f"❓ ตรวจผลไม่ได้ {unknown_n} ไม้ (เก่าเกินข้อมูล ใส่ Exit ในชีตได้)")
     return "\n".join(lines)
+
+
+DAY_START_HOUR = int(os.environ.get("DAY_START_HOUR", "0"))              # วันใหม่เริ่มกี่โมง (เวลา MT5) 0 = เที่ยงคืนของ MT5
+DAILY_WINDOW_HOURS = int(os.environ.get("DAILY_WINDOW_HOURS", "3"))      # ส่งสรุปประจำวันภายในกี่ชม.แรกของวันใหม่
+WEEKLY_WINDOW_HOURS = int(os.environ.get("WEEKLY_WINDOW_HOURS", "12"))   # ส่งสรุปสัปดาห์ภายในกี่ชม.หลังตลาดปิด
 
 
 def trade_alert_msg(t, r):
@@ -770,47 +776,127 @@ def manual_alert_msg(t, r):
     ])
 
 
-def monitor_trades(levels):
-    """แจ้งเมื่อกรอก Exit (ปิดมือ) และเฝ้าไม้ที่ยังเปิด: ถ้า TP/SL ชนในช่วงไม่กี่นาทีที่ผ่านมา แจ้งเตือน"""
+def day_bounds(ts):
+    """ช่วงวัน (เวลา MT5) ที่ ts อยู่ คืน (เริ่ม, สิ้นสุด)"""
+    h = pd.Timedelta(hours=DAY_START_HOUR)
+    start = (ts - h).floor("D") + h
+    return start, start + pd.Timedelta(days=1)
+
+
+def tally_text(results, ts):
+    """สถิติสะสมของวันที่ ts อยู่ (นับรวมไม้ที่เพิ่งปิด) เริ่ม 0 ใหม่ทุกวัน"""
+    start, end = day_bounds(ts)
+    day = [r for r in results if r["status"] == "closed" and start <= r["close_time"] < end]
+    s = summarize(day)
+    if not s["n"]:
+        return ""
+    return (f"\n\n📈 สถิติวันที่ {start:%d/%m} (รวมไม้นี้): ชนะ {s['w']} | แพ้ {s['l']} | เสมอ {s['be']}\n"
+            f"🎯 Win rate {s['wr']:.0f}% | เฉลี่ย {s['avg_r']:+.2f}R/ไม้ | รวม {s['sum_r']:+.2f}R")
+
+
+def collect_results(trades, bars_needed_days=MONITOR_DAYS):
+    """ประเมินไม้ทุกไม้ที่ตรวจได้ (ปิดมือ + ไม้ที่เปิดไม่เกิน MONITOR_DAYS วัน) คืน (รายการ (t, r), ดึงข้อมูลสำเร็จหรือไม่)"""
     now = now_server()
-
-    # ปิดมือ: กรอก Exit แล้วแจ้งผลทันที (แจ้งซ้ำเมื่อแก้ราคา Exit)
-    for t in levels.get("trades", []):
-        if t["exit"] is None:
-            continue
-        r = evaluate_trade(t, None)
-        if now - r["close_time"] > timedelta(minutes=MANUAL_ALERT_WINDOW_MIN):
-            continue
-        fire(f"trade:{t['id']}", f"manual:{t['exit']:g}", manual_alert_msg(t, r))
-
-    trades = [t for t in levels.get("trades", [])
-              if t["exit"] is None and timedelta(0) <= now - t["time"] <= timedelta(days=MONITOR_DAYS)]
-    if not trades:
-        return
-    bars = fetch_5m(MONITOR_DAYS + 1)
-    if bars is None:
-        return
+    live_ids = {t["id"] for t in trades
+                if t["exit"] is None and timedelta(0) <= now - t["time"] <= timedelta(days=bars_needed_days)}
+    bars = fetch_5m(bars_needed_days + 1) if live_ids else None
+    ok = bars is not None or not live_ids
+    out = []
     for t in trades:
-        r = evaluate_trade(t, bars)
+        if t["exit"] is not None:
+            out.append((t, evaluate_trade(t, None)))
+        elif t["id"] in live_ids:
+            out.append((t, evaluate_trade(t, bars)))
+    return out, ok
+
+
+def monitor_trades(levels):
+    """แจ้งผลไม้ที่เพิ่งปิด (TP/SL ชน หรือกรอก Exit) พร้อมสถิติสะสมของวันนั้น"""
+    now = now_server()
+    pairs, _ = collect_results(levels.get("trades", []))
+    all_r = [r for _, r in pairs]
+    for t, r in pairs:
         if r["status"] != "closed":
             continue
-        if now - r["close_time"] > timedelta(minutes=TRADE_ALERT_WINDOW_MIN):
-            continue
-        fire(f"trade:{t['id']}", r["how"], trade_alert_msg(t, r))
+        age = now - r["close_time"]
+        if r["how"] == "manual":
+            if age > timedelta(minutes=MANUAL_ALERT_WINDOW_MIN):
+                continue
+            msg, val = manual_alert_msg(t, r), f"manual:{t['exit']:g}"
+        else:
+            if age > timedelta(minutes=TRADE_ALERT_WINDOW_MIN):
+                continue
+            msg, val = trade_alert_msg(t, r), r["how"]
+        fire(f"trade:{t['id']}", val, msg + tally_text(all_r, r["close_time"]))
+
+
+def build_daily_msg(day_start, day_res, open_n):
+    s = summarize(day_res)
+    lines = [
+        f"📅 <b>สรุปประจำวัน {day_start:%d/%m}</b> (เวลา MT5)",
+        "",
+        f"📌 ไม้ที่ปิดทั้งวัน: <b>{s['n']}</b> ไม้",
+        f"✅ ชนะ {s['w']} | ❌ แพ้ {s['l']} | ➖ เสมอ {s['be']}",
+        f"🎯 Win rate: <b>{s['wr']:.0f}%</b>",
+        f"📐 RR ที่วางไว้เฉลี่ย: 1:{s['planned']:.2f}",
+        f"💰 เฉลี่ยต่อไม้: <b>{s['avg_r']:+.2f}R</b> | รวม {s['sum_r']:+.2f}R",
+    ]
+    if open_n:
+        lines.append(f"⏳ ไม้ที่ยังเปิดอยู่: {open_n}")
+    lines += ["", "🔄 เริ่มนับสถิติวันใหม่จาก 0"]
+    return "\n".join(lines)
+
+
+def maybe_send_daily(now=None, df=None):
+    """ขึ้นวันใหม่ (ตามเวลา MT5): สรุปไม้ของวันที่ผ่านมา แล้วสถิติเรียลไทม์เริ่มนับ 0 ใหม่"""
+    now = now or now_server()
+    today_start, _ = day_bounds(now)
+    if now - today_start >= pd.Timedelta(hours=DAILY_WINDOW_HOURS):
+        return
+    yday_start = today_start - pd.Timedelta(days=1)
+    day_id = yday_start.strftime("%Y-%m-%d")
+    if sent.get("daily") == day_id:
+        return
+
+    if df is None:
+        df = fetch_sheet_df()
+    pairs, ok = collect_results(parse_trades(df))
+    if not ok:
+        print("ดึงข้อมูล 5 นาทีไม่ได้ ลองสรุปประจำวันใหม่รอบหน้า")
+        return
+    day_res = [r for _, r in pairs if r["status"] == "closed" and yday_start <= r["close_time"] < today_start]
+    open_n = sum(1 for _, r in pairs if r["status"] == "open")
+    if day_res and not send_telegram_message(build_daily_msg(yday_start, day_res, open_n)):
+        return
+    sent["daily"] = day_id
+    save_state()
+    if day_res:
+        print(f"✅ ส่งสรุปประจำวัน {day_id} แล้ว")
+
+
+def week_close_utc(now_utc):
+    """เวลาปิดตลาดล่าสุด (ศุกร์ 17:00 เวลานิวยอร์ก) เป็น UTC แบบไม่มี tz"""
+    ny_now = now_utc.astimezone(ZoneInfo(NY_TZ))
+    fri = (ny_now - timedelta(days=(ny_now.weekday() - 4) % 7)).replace(hour=17, minute=0, second=0, microsecond=0)
+    if fri > ny_now:
+        fri -= timedelta(days=7)
+    return fri.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def maybe_send_weekly(now_utc=None, df=None):
-    """ส่งสรุปทุกวันเสาร์ 08:00 เวลาไทย (= 01:00 UTC) ภายในช่วง 01:00-05:00 UTC"""
+    """ตลาดปิดสัปดาห์ (ศุกร์ 17:00 นิวยอร์ก): สรุปไม้ทั้งสัปดาห์ ส่งภายใน WEEKLY_WINDOW_HOURS ชม.แรก"""
     global _weekly_force_done
     now_utc = now_utc or datetime.now(timezone.utc)
-    in_window = now_utc.weekday() == 5 and 1 <= now_utc.hour < 5
+    close_utc = week_close_utc(now_utc)
+    since = now_utc.replace(tzinfo=None) - close_utc
+    in_window = timedelta(0) <= since < timedelta(hours=WEEKLY_WINDOW_HOURS)
     force = WEEKLY_FORCE and not _weekly_force_done
     if not in_window and not force:
         return
 
     if in_window:
-        end_utc = now_utc.replace(hour=1, minute=0, second=0, microsecond=0, tzinfo=None)
-        week_id = end_utc.strftime("%Y-%m-%d")
+        end_utc = close_utc
+        week_id = close_utc.strftime("%Y-%m-%d")
         if sent.get("weekly") == week_id:
             return
     else:
@@ -882,6 +968,10 @@ def check_market():
         send_heartbeat(df_1h)
         last_heartbeat_time = time.time()
 
+    try:
+        maybe_send_daily()
+    except Exception as e:
+        print(f"Daily summary error: {e}")
     try:
         maybe_send_weekly()
     except Exception as e:
