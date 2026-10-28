@@ -563,6 +563,11 @@ MONITOR_DAYS = 4                                                   # เฝ้�
 TRADE_ALERT_WINDOW_MIN = int(os.environ.get("TRADE_ALERT_WINDOW_MIN", "20"))
 WEEKLY_FORCE = os.environ.get("WEEKLY_FORCE", "0") == "1"          # ทดสอบ: ส่งสรุปทันที 1 ครั้งต่อการรัน
 _weekly_force_done = False
+# แจ้งผลเมื่อกรอก Exit (ปิดมือ) ถ้าเวลาปิดอยู่ภายในกี่นาทีที่ผ่านมา (กันส่งซ้ำของเก่าเมื่อบอทรีสตาร์ท)
+MANUAL_ALERT_WINDOW_MIN = int(os.environ.get("MANUAL_ALERT_WINDOW_MIN", "120"))
+# เวลาในคอลัมน์ Time/ExitTime ของชีต: ค่าว่าง = เวลา MT5 / ตั้ง 7 = เวลาไทย (UTC+7)
+_sheet_off = os.environ.get("SHEET_TIME_UTC_OFFSET_HOURS", "").strip()
+SHEET_TIME_UTC_OFFSET_HOURS = float(_sheet_off) if _sheet_off != "" else None
 _bars5_cache = {"ts": 0.0, "period": None, "df": None}
 
 
@@ -600,10 +605,20 @@ def _ts(v):
     try:
         if v is None or str(v).strip() in ("", "nan", "NaT", "None"):
             return None
-        t = pd.Timestamp(str(v).strip())
-        return None if pd.isna(t) else t
+        txt = str(v).strip()
+        # รูปแบบ 2026-10-27 14:30 อ่านตามปกติ / รูปแบบไทย 27/10/2026 14:30 อ่านแบบ วัน/เดือน/ปี
+        iso = len(txt) >= 5 and txt[:4].isdigit() and txt[4] == "-"
+        t = pd.to_datetime(txt, errors="coerce") if iso else pd.to_datetime(txt, errors="coerce", dayfirst=True)
+        return None if pd.isna(t) else pd.Timestamp(t)
     except Exception:
         return None
+
+
+def sheet_to_server(t):
+    """แปลงเวลาที่กรอกในชีตเป็นเวลา MT5 (ถ้าตั้ง SHEET_TIME_UTC_OFFSET_HOURS)"""
+    if t is None or SHEET_TIME_UTC_OFFSET_HOURS is None:
+        return t
+    return utc_to_server(t - pd.Timedelta(hours=SHEET_TIME_UTC_OFFSET_HOURS))
 
 
 def parse_trades(df):
@@ -622,7 +637,7 @@ def parse_trades(df):
         else:
             print(f"⚠️ ออเดอร์แถว {i + 2}: Side '{side_raw}' ไม่รู้จัก (ใช้ BUY หรือ SELL)")
             continue
-        t, entry, sl, tp = _ts(row["Time"]), _num(row["Entry"]), _num(row["SL"]), _num(row["TP"])
+        t, entry, sl, tp = sheet_to_server(_ts(row["Time"])), _num(row["Entry"]), _num(row["SL"]), _num(row["TP"])
         ok = t is not None and entry is not None and sl is not None and tp is not None
         if ok:
             ok = (sl < entry < tp) if side == "buy" else (tp < entry < sl)
@@ -633,7 +648,7 @@ def parse_trades(df):
             "id": f"{t:%Y%m%d%H%M}|{side}|{entry:g}|{sl:g}|{tp:g}",
             "time": t, "side": side, "entry": entry, "sl": sl, "tp": tp,
             "exit": _num(row["Exit"]) if "Exit" in df.columns else None,
-            "exit_time": _ts(row["ExitTime"]) if "ExitTime" in df.columns else None,
+            "exit_time": sheet_to_server(_ts(row["ExitTime"])) if "ExitTime" in df.columns else None,
         })
     return trades
 
@@ -742,9 +757,32 @@ def trade_alert_msg(t, r):
     ])
 
 
+def manual_alert_msg(t, r):
+    side_u = "BUY" if t["side"] == "buy" else "SELL"
+    diff = (t["exit"] - t["entry"]) if t["side"] == "buy" else (t["entry"] - t["exit"])
+    icon, word = {"win": ("✅", "ชนะ"), "loss": ("❌", "แพ้"), "be": ("➖", "เสมอ")}[r["result"]]
+    return "\n".join([
+        f"{icon} <b>ปิดไม้เอง - {side_u} ({word})</b>",
+        f"🕒 เข้า {fmt(t['time'])} → ปิด {fmt(r['close_time'])} (เวลา MT5)",
+        f"เข้า <code>{t['entry']:.2f}</code> | ปิด <code>{t['exit']:.2f}</code>",
+        f"SL <code>{t['sl']:.2f}</code> | TP <code>{t['tp']:.2f}</code>",
+        f"ผล <b>{r['r']:+.2f}R</b> ({diff:+.2f} จุดราคา)",
+    ])
+
+
 def monitor_trades(levels):
-    """เฝ้าไม้ที่ยังเปิด: ถ้า TP/SL ชนในช่วงไม่กี่นาทีที่ผ่านมา แจ้งเตือน"""
+    """แจ้งเมื่อกรอก Exit (ปิดมือ) และเฝ้าไม้ที่ยังเปิด: ถ้า TP/SL ชนในช่วงไม่กี่นาทีที่ผ่านมา แจ้งเตือน"""
     now = now_server()
+
+    # ปิดมือ: กรอก Exit แล้วแจ้งผลทันที (แจ้งซ้ำเมื่อแก้ราคา Exit)
+    for t in levels.get("trades", []):
+        if t["exit"] is None:
+            continue
+        r = evaluate_trade(t, None)
+        if now - r["close_time"] > timedelta(minutes=MANUAL_ALERT_WINDOW_MIN):
+            continue
+        fire(f"trade:{t['id']}", f"manual:{t['exit']:g}", manual_alert_msg(t, r))
+
     trades = [t for t in levels.get("trades", [])
               if t["exit"] is None and timedelta(0) <= now - t["time"] <= timedelta(days=MONITOR_DAYS)]
     if not trades:
