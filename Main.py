@@ -2,6 +2,7 @@ import io
 import os
 import sys
 import json
+import html
 import time
 import threading
 from datetime import datetime, timezone, timedelta
@@ -76,10 +77,32 @@ HEARTBEAT_INTERVAL = 43200
 ERROR_ALERT_AT = 3
 STATE_FILE = "alert_state.json"
 
+# เก็บสถานะ (รวมสมุดบันทึกผลไม้) ไว้ที่ Upstash Redis ฟรี เพื่อไม่ให้หายตอน Render รีสตาร์ท/redeploy (ไม่บังคับ)
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+STATE_KEY = os.environ.get("STATE_KEY", "xauusd_bot_state")
+REMOTE_ENABLED = bool(UPSTASH_URL and UPSTASH_TOKEN)
+
 # ==========================================
 # 💾 สถานะ
 # ==========================================
+def _remote(cmd):
+    r = requests.post(UPSTASH_URL, headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, json=cmd, timeout=8)
+    r.raise_for_status()
+    return r.json().get("result")
+
+
 def load_state():
+    if REMOTE_ENABLED:
+        try:
+            raw = _remote(["GET", STATE_KEY])
+            if raw:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    print("☁️ โหลดสถานะจาก Upstash แล้ว")
+                    return data
+        except Exception as e:
+            print(f"⚠️ โหลดสถานะจาก Upstash ไม่สำเร็จ: {e}")
     try:
         with open(STATE_FILE, "r") as f:
             data = json.load(f)
@@ -94,9 +117,14 @@ def save_state():
             json.dump(sent, f)
     except Exception as e:
         print(f"⚠️ บันทึกสถานะไม่สำเร็จ: {e}")
+    if REMOTE_ENABLED:
+        try:
+            _remote(["SET", STATE_KEY, json.dumps(sent)])
+        except Exception as e:
+            print(f"⚠️ บันทึกสถานะลง Upstash ไม่สำเร็จ: {e}")
 
 
-sent = load_state()  # "1h:live_sell" -> id แท่งที่แจ้งแล้ว / "1h:cd_sell" -> แท่งที่เตือนทันทีล่าสุด
+sent = load_state()  # "1h:live_sell" -> id แท่งที่แจ้งแล้ว / "1h:cd_sell" -> แท่งที่เตือนทันทีล่าสุด / "ledger" -> สมุดบันทึกผลไม้
 last_heartbeat_time = time.time()
 last_cycle_time = time.time()
 WATCHDOG_SEC = int(os.environ.get("WATCHDOG_SEC", "600"))
@@ -104,6 +132,7 @@ sheet_errors = 0
 data_errors = 0
 sheet_alerted = False
 data_alerted = False
+sheet_last_err = ""
 
 # ==========================================
 # 🌐 เว็บเซิร์ฟเวอร์จำลองให้ Render ผ่านพอร์ต
@@ -190,6 +219,8 @@ def parse_news(df):
 
 def read_levels(df, col):
     """อ่านทุกช่องที่มีตัวเลขในคอลัมน์ (แถว 2 ลงไป) = หลายแนว"""
+    if col not in df.columns:
+        raise ValueError(f"ไม่พบคอลัมน์ {col} ในชีต")
     vals = pd.to_numeric(df[col].astype(str).str.replace(",", ""), errors="coerce").dropna()
     if vals.empty:
         raise ValueError(f"คอลัมน์ {col} ไม่มีตัวเลข")
@@ -208,20 +239,28 @@ def get_levels_from_google_sheet():
         df = fetch_sheet_df()
         try:
             trades = parse_trades(df)
+            trades_ok = getattr(parse_trades, "last_ok", True)
         except Exception as e:
             print(f"⚠️ อ่านออเดอร์จากชีตไม่สำเร็จ: {e}")
-            trades = []
+            trades, trades_ok = [], False
         problems = list(getattr(parse_trades, "last_problems", []))
-        return {
+        result = {
             "1h": {"res": read_levels(df, "1H_Res"), "sup": read_levels(df, "1H_Sup")},
             "4h": {"res": read_levels(df, "4H_Res"), "sup": read_levels(df, "4H_Sup")},
             "news": parse_news(df),
             "trades": trades,
+            "trades_ok": trades_ok,
             "problems": problems,
         }
+        get_levels_from_google_sheet.last_error = ""
+        return result
     except Exception as e:
+        get_levels_from_google_sheet.last_error = str(e)
         print(f"⚠️ อ่าน Google Sheets ไม่สำเร็จ: {e}")
         return None
+
+
+get_levels_from_google_sheet.last_error = ""
 
 # ==========================================
 # 🕒 เวลา MT5
@@ -557,8 +596,8 @@ def check_timeframe(tf, df, levels, last_1h_start, k4_now):
                      next_target("buy", c_close, sup_list, res_list), "", risk))
 
 # ==========================================
-# 🧾 ออเดอร์จากชีต + สรุปผลรายสัปดาห์
-# คอลัมน์ในชีต: Time, Side, Entry, SL, TP (บังคับ) | Exit, ExitTime (ไม่บังคับ ใช้เมื่อปิดมือ/ขยับ SL)
+# 🧾 ออเดอร์จากชีต + สรุปผลรายสัปดาห์/รายเดือน
+# คอลัมน์ในชีต: Time, Side, Entry, SL, TP (บังคับ) | SL0, Exit, ExitTime (ไม่บังคับ ใช้เมื่อปิดมือ/ขยับ SL)
 # ราคาในชีตเป็นระดับ MT5, เวลาเป็นเวลา MT5 รูปแบบ 2026-10-27 14:30
 # ==========================================
 BE_R = float(os.environ.get("BE_R", "0.05"))                       # |R| ไม่เกินค่านี้ นับเป็นเสมอ
@@ -632,7 +671,9 @@ def parse_trades(df):
     need = ["Time", "Side", "Entry", "SL", "TP"]
     problems = []
     parse_trades.last_problems = problems
+    parse_trades.last_ok = True
     if not all(c in df.columns for c in need):
+        parse_trades.last_ok = False   # ไม่มีคอลัมน์ออเดอร์ครบ = อ่านไม่สำเร็จ (ห้ามประกาศว่า "แก้แล้ว")
         return []
     trades = []
     for i, row in df.iterrows():
@@ -685,6 +726,7 @@ def parse_trades(df):
 
 
 parse_trades.last_problems = []
+parse_trades.last_ok = True
 
 
 def classify(r, pts):
@@ -755,6 +797,16 @@ def summarize(results):
     pl = [r["planned_rr"] for r in closed if r["planned_rr"] is not None]
     sum_r = sum(rs)
     sum_pts = sum(r["pts"] for r in closed)
+
+    # Profit Factor = กำไรรวม / ขาดทุนรวม, Max Drawdown = ยอดตกจากจุดสูงสุดของกำไรสะสม (หน่วยจุดราคา)
+    pts_seq = [r["pts"] for r in sorted(closed, key=lambda r: r["close_time"])]
+    gross_p = sum(p for p in pts_seq if p > 0)
+    gross_l = -sum(p for p in pts_seq if p < 0)
+    eq = peak = mdd = 0.0
+    for p in pts_seq:
+        eq += p
+        peak = max(peak, eq)
+        mdd = max(mdd, peak - eq)
     return {
         "n": n, "w": w, "l": l, "be": n - w - l,
         "wr": (w / n * 100) if n else 0.0,
@@ -763,6 +815,9 @@ def summarize(results):
         "n_pl": len(pl), "planned": (sum(pl) / len(pl)) if pl else 0.0,
         "sum_pts": sum_pts,
         "avg_pts": (sum_pts / n) if n else 0.0,
+        "gp": gross_p, "gl": gross_l,
+        "pf": (gross_p / gross_l) if gross_l > 0 else None,
+        "mdd": mdd,
     }
 
 
@@ -776,6 +831,20 @@ def r_text(s):
     return txt
 
 
+def pf_text(s):
+    if s["pf"] is not None:
+        return f"{s['pf']:.2f}"
+    return "∞ (ไม่มีไม้ขาดทุน)" if s["gp"] > 0 else "-"
+
+
+def risk_lines(s):
+    """บรรทัด Profit Factor + Max Drawdown"""
+    return [
+        f"⚖️ Profit Factor: <b>{pf_text(s)}</b> (กำไรรวม {s['gp']:.2f} / ขาดทุนรวม {s['gl']:.2f})",
+        f"📉 Max Drawdown: <b>{s['mdd']:.2f} จุดราคา</b>",
+    ]
+
+
 def pnl_label(pts):
     """กำไร/ติดลบสุทธิเป็นจุดราคา (ราคาทอง 1 ดอลลาร์ = 1 จุดราคา)"""
     if pts > 0.005:
@@ -783,6 +852,72 @@ def pnl_label(pts):
     if pts < -0.005:
         return f"🔴 ติดลบ {pts:+.2f} จุดราคา"
     return "⚪ เสมอตัว 0.00 จุดราคา"
+
+
+# ---------- สมุดบันทึกผล (ledger): จำผลไม้ที่ปิดแล้ว แม้ลบแถวในชีตไปแล้ว ----------
+def remember_closed(t, r):
+    """เก็บผลไม้ที่ปิดแล้วลงสมุดบันทึก ไว้ใช้สรุปเดือนเมื่อแถวถูกลบออกจากชีต"""
+    led = sent.setdefault("ledger", {})
+    entry = {"side": t["side"], "time": str(t["time"]), "ct": str(r["close_time"]),
+             "res": r["result"], "r": r["r"], "pts": r["pts"], "pl": r["planned_rr"], "how": r["how"]}
+    if led.get(t["id"]) == entry:
+        return
+    led[t["id"]] = entry
+    cutoff = now_server() - pd.Timedelta(days=120)
+    for k in [k for k, v in led.items() if pd.Timestamp(v["ct"]) < cutoff]:
+        led.pop(k, None)
+    save_state()
+
+
+def ledger_to_result(tid, e):
+    return {"id": tid, "side": e["side"], "planned_rr": e["pl"], "time": pd.Timestamp(e["time"]),
+            "status": "closed", "how": e["how"], "result": e["res"], "r": e["r"],
+            "close_time": pd.Timestamp(e["ct"]), "ambiguous": False, "pts": e["pts"]}
+
+
+def merge_with_ledger(results):
+    """รวมผลจากชีตกับสมุดบันทึก: ไม้ที่ชีตตรวจไม่ได้/ถูกลบไปแล้ว ใช้ค่าในสมุดบันทึกแทน"""
+    led = sent.get("ledger", {})
+    out, seen = [], set()
+    for r in results:
+        seen.add(r["id"])
+        if r["status"] == "unknown" and r["id"] in led:
+            out.append(ledger_to_result(r["id"], led[r["id"]]))
+        else:
+            out.append(r)
+    for tid, e in led.items():
+        if tid not in seen:
+            out.append(ledger_to_result(tid, e))
+    return out
+
+
+_last_backfill = 0.0
+
+
+def backfill_ledger(trades):
+    """ไม้เก่ากว่า MONITOR_DAYS ที่ยังไม่อยู่ในสมุดบันทึก: ย้อนตรวจจากข้อมูล 5 นาทีแล้วบันทึกผล (ทุก 6 ชม.)"""
+    global _last_backfill
+    if time.time() - _last_backfill < 21600:
+        return
+    now = now_server()
+    led = sent.get("ledger", {})
+    todo = [t for t in trades
+            if t["exit"] is None and t["id"] not in led
+            and timedelta(days=MONITOR_DAYS) < now - t["time"]]
+    if not todo:
+        _last_backfill = time.time()
+        return
+    days = min((now - min(t["time"] for t in todo)).days + 2, 59)
+    bars = fetch_5m(days)
+    if bars is None:
+        print("backfill: ดึงข้อมูล 5 นาทีไม่ได้ ลองใหม่รอบหน้า")
+        return
+    for t in todo:
+        r = evaluate_trade(t, bars)
+        if r["status"] == "closed":
+            remember_closed(t, r)
+    _last_backfill = time.time()
+    print(f"📒 backfill สมุดบันทึกผลแล้ว ({len(todo)} ไม้ที่ตรวจ)")
 
 
 def build_weekly_msg(start_s, end_s, week_res, all_res, skipped=0):
@@ -801,6 +936,7 @@ def build_weekly_msg(start_s, end_s, week_res, all_res, skipped=0):
             f"💰 {r_text(ws)}",
             f"💵 สุทธิทั้งสัปดาห์: <b>{pnl_label(ws['sum_pts'])}</b> (เฉลี่ย {ws['avg_pts']:+.2f}/ไม้)",
         ]
+        lines += risk_lines(ws)
     else:
         lines.append("📌 สัปดาห์นี้ไม่มีไม้ที่ปิด")
     amb = sum(1 for r in week_res if r.get("ambiguous"))
@@ -915,20 +1051,52 @@ def collect_results(trades, bars_needed_days=MONITOR_DAYS):
     return out, ok
 
 
+def notify_recovered(levels, cur_bad, cur_future):
+    """แจ้งเมื่อแถวที่เคยเตือนว่ามีปัญหา ถูกแก้ไขแล้ว"""
+    valid_rows = {t["row"] for t in levels.get("trades", [])}
+    changed = False
+    for key in [k for k in sent if k.startswith("bad:")]:
+        row = key.split(":", 1)[1]
+        if row in cur_bad:
+            continue
+        if row.isdigit() and int(row) in valid_rows:
+            txt = f"✅ <b>ออเดอร์ในชีตแถว {row} แก้ไขแล้ว</b>\nบอทอ่านได้และนับเข้าสถิติแล้ว"
+        else:
+            txt = f"✅ <b>แถว {row} ในชีตไม่มีปัญหาแล้ว</b>\n(ถูกลบ/เคลียร์ บอทไม่นับแถวนี้)"
+        if send_telegram_message(txt):
+            sent.pop(key, None)
+            changed = True
+    for key in [k for k in sent if k.startswith("future:")]:
+        if key in cur_future:
+            continue
+        row = str(sent.get(key, ""))
+        where = f"แถว {row} " if row.isdigit() else ""
+        if send_telegram_message(f"✅ <b>เวลาเข้าไม้ {where}แก้ไขแล้ว</b>\nไม่อยู่ในอนาคตแล้ว บอทเริ่มนับผลให้แล้ว"):
+            sent.pop(key, None)
+            changed = True
+    if changed:
+        save_state()
+
+
 def monitor_trades(levels):
     """แจ้งผลไม้ที่เพิ่งปิด (TP/SL ชน หรือกรอก Exit) พร้อมสถิติสะสมของวันนั้น"""
+    global _known_exits
     now = now_server()
 
+    cur_bad, cur_future = {}, set()
     for row, reason in levels.get("problems", []):
+        cur_bad[str(row)] = reason
         fire(f"bad:{row}", reason,
              f"⚠️ <b>ออเดอร์ในชีตแถว {row} ไม่ถูกนับ</b>\n{reason}\nแก้ในชีตแล้วบอทจะนับให้เอง")
     for t in levels.get("trades", []):
         if t["exit"] is None and t["time"] > now + timedelta(minutes=5):
-            fire(f"future:{t['id']}", "1",
+            cur_future.add(f"future:{t['id']}")
+            fire(f"future:{t['id']}", str(t["row"]),
                  f"⚠️ <b>ออเดอร์ในชีตแถว {t['row']}</b> มีเวลาเข้าไม้ {fmt(t['time'])} (เวลา MT5) อยู่ในอนาคต\n"
                  f"บอทจึงยังไม่นับผล เช็กวันที่/เวลาที่กรอก")
+    if levels.get("trades_ok", True):   # อ่านชีตสำเร็จจริงเท่านั้นถึงประกาศว่าแก้แล้ว
+        notify_recovered(levels, cur_bad, cur_future)
 
-    global _known_exits
     pairs, _ = collect_results(levels.get("trades", []))
     all_r = [r for _, r in pairs]
     window = timedelta(minutes=MANUAL_ALERT_WINDOW_MIN)
@@ -938,6 +1106,7 @@ def monitor_trades(levels):
     for t, r in pairs:
         if r["status"] != "closed":
             continue
+        remember_closed(t, r)   # จดผลลงสมุดบันทึก ลบแถวในชีตทีหลังได้
         age = now - r["close_time"]
         key, val = f"trade:{t['id']}", None
         if r["how"] == "manual":
@@ -952,6 +1121,11 @@ def monitor_trades(levels):
         fire(key, val, msg + tally_text(all_r, r["close_time"]))
         if r["how"] == "manual" and sent.get(key) == val:
             _known_exits[t["id"]] = t["exit"]
+
+    try:
+        backfill_ledger(levels.get("trades", []))
+    except Exception as e:
+        print(f"Backfill error: {e}")
 
 
 def build_daily_msg(day_start, day_res, open_n, skipped=0):
@@ -1044,7 +1218,7 @@ def maybe_send_weekly(now_utc=None, df=None):
         else:
             _weekly_force_done = True
 
-    if not trades:
+    if not trades and not sent.get("ledger"):
         print("ไม่มีออเดอร์ในชีต ข้ามสรุปรายสัปดาห์")
         mark_done()
         return
@@ -1052,19 +1226,151 @@ def maybe_send_weekly(now_utc=None, df=None):
     replay = [t for t in trades if t["exit"] is None]
     bars = None
     if replay:
-        days = (now_server() - min(t["time"] for t in replay)).days + 2
+        days = min((now_server() - min(t["time"] for t in replay)).days + 2, 59)
         bars = fetch_5m(days)
         if bars is None:
             print("ดึงข้อมูล 5 นาทีไม่ได้ ลองใหม่รอบหน้า")
             return
 
-    results = [evaluate_trade(t, bars) for t in trades]
+    results = merge_with_ledger([evaluate_trade(t, bars) for t in trades])
     start_s, end_s = utc_to_server(start_utc), utc_to_server(end_utc)
     week_res = [r for r in results if r["status"] == "closed" and start_s < r["close_time"] <= end_s]
     if send_telegram_message(build_weekly_msg(start_s, end_s, week_res, results,
-                                                      skipped=len(parse_trades.last_problems))):
+                                              skipped=len(parse_trades.last_problems))):
         mark_done()
         print("✅ ส่งสรุปรายสัปดาห์แล้ว")
+
+# ---------- สรุปรายเดือน ----------
+MONTHLY_DAY = int(os.environ.get("MONTHLY_DAY", "25"))
+MONTHLY_HOUR_TH = int(os.environ.get("MONTHLY_HOUR_TH", "5"))            # เวลาไทย
+MONTHLY_WINDOW_HOURS = int(os.environ.get("MONTHLY_WINDOW_HOURS", "24"))  # บอทดับ ส่งย้อนหลังได้ภายในกี่ชม.
+MONTHLY_START_TH = os.environ.get("MONTHLY_START_TH", "2026-10-20 00:00")      # จุดเริ่มรอบแรก (เวลาไทย)
+MONTHLY_FIRST_END_TH = os.environ.get("MONTHLY_FIRST_END_TH", "2026-11-25 05:00")  # รายงานฉบับแรกส่งเมื่อไหร่ (เวลาไทย)
+MONTHLY_FORCE = os.environ.get("MONTHLY_FORCE", "0") == "1"              # ทดสอบ: ส่งทันที 1 ครั้ง
+_monthly_force_done = False
+
+
+def monthly_bounds(now_th):
+    """ช่วงสรุป (เวลาไทย): 25 เดือนก่อน 05:00 -> 25 เดือนนี้ 05:00
+    รอบแรก (end == MONTHLY_FIRST_END_TH) เริ่มนับที่ MONTHLY_START_TH / ก่อนรอบแรกคืน (None, None)"""
+    end = pd.Timestamp(year=now_th.year, month=now_th.month, day=MONTHLY_DAY, hour=MONTHLY_HOUR_TH)
+    if now_th < end:
+        end = end - pd.DateOffset(months=1)
+    start = end - pd.DateOffset(months=1)
+    first_end = pd.Timestamp(MONTHLY_FIRST_END_TH)
+    if end < first_end:
+        return None, None
+    if end == first_end:
+        start = pd.Timestamp(MONTHLY_START_TH)
+    return start, end
+
+
+def build_monthly_msg(start_th, end_th, start_s, end_s, month_res, all_res, skipped=0):
+    s = summarize(month_res)
+    lines = ["🗓 <b>สรุปผลเทรดประจำเดือน</b>",
+             f"📆 {start_th:%d/%m/%Y %H:%M} → {end_th:%d/%m/%Y %H:%M} (เวลาไทย)", ""]
+    if not s["n"]:
+        lines.append("📌 ช่วงนี้ไม่มีไม้ที่ปิด")
+    else:
+        lines += [
+            f"📌 ไม้ที่ปิดทั้งหมด: <b>{s['n']}</b> ไม้",
+            f"✅ ชนะ {s['w']} | ❌ แพ้ {s['l']} | ➖ เสมอ {s['be']}",
+            f"🎯 Win rate: <b>{s['wr']:.0f}%</b>",
+            f"📐 RR ที่วางไว้เฉลี่ย: 1:{s['planned']:.2f}" if s["n_pl"] else "📐 RR ที่วางไว้เฉลี่ย: -",
+            f"💰 {r_text(s)}",
+            f"💵 สุทธิ: <b>{pnl_label(s['sum_pts'])}</b> (เฉลี่ย {s['avg_pts']:+.2f}/ไม้)",
+        ]
+        lines += risk_lines(s)
+        lines.append("")
+        for side, name in (("buy", "BUY"), ("sell", "SELL")):
+            x = summarize([r for r in month_res if r["side"] == side])
+            if x["n"]:
+                lines.append(f"{name}: {x['n']} ไม้ | ชนะ {x['w']} แพ้ {x['l']} เสมอ {x['be']} "
+                             f"| WR {x['wr']:.0f}% | {x['sum_pts']:+.2f} จุด")
+        lines += ["", "📅 แยกรายสัปดาห์ (เวลา MT5)"]
+        b0, i = start_s, 1
+        while b0 < end_s:
+            b1 = min(b0 + pd.Timedelta(days=7), end_s)
+            x = summarize([r for r in month_res if b0 < r["close_time"] <= b1])
+            lines.append(f"• สัปดาห์ {i} ({b0:%d/%m}–{b1:%d/%m}): {x['n']} ไม้ | "
+                         f"ชนะ {x['w']} แพ้ {x['l']} | {x['sum_pts']:+.2f} จุด")
+            b0, i = b1, i + 1
+        best = max(month_res, key=lambda r: r["pts"])
+        worst = min(month_res, key=lambda r: r["pts"])
+        cur = mx = 0
+        for r in sorted(month_res, key=lambda r: r["close_time"]):
+            cur = cur + 1 if r["result"] == "loss" else 0
+            mx = max(mx, cur)
+        lines += [
+            "",
+            f"🏆 ไม้ดีที่สุด: {best['side'].upper()} เข้า {fmt(best['time'])} → {best['pts']:+.2f} จุด",
+            f"💥 ไม้แย่ที่สุด: {worst['side'].upper()} เข้า {fmt(worst['time'])} → {worst['pts']:+.2f} จุด",
+            f"📉 แพ้ติดต่อกันสูงสุด: {mx} ไม้",
+        ]
+    open_n = sum(1 for r in all_res if r["status"] == "open")
+    unknown_n = sum(1 for r in all_res if r["status"] == "unknown")
+    if open_n:
+        lines.append(f"⏳ ไม้ที่ยังเปิดอยู่: {open_n}")
+    if unknown_n:
+        lines.append(f"❓ ตรวจผลไม่ได้ {unknown_n} ไม้ (เก่าเกินข้อมูลและไม่มีในสมุดบันทึก ใส่ Exit ในชีตได้)")
+    if skipped:
+        lines.append(f"⚠️ มี {skipped} แถวในชีตไม่ถูกนับ (ข้อมูลไม่ถูกต้อง)")
+    return "\n".join(lines)
+
+
+def maybe_send_monthly(df=None):
+    global _monthly_force_done
+    now_th = pd.Timestamp(datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=7))
+    start_th, end_th = monthly_bounds(now_th)
+    in_window = (end_th is not None
+                 and pd.Timedelta(0) <= now_th - end_th < pd.Timedelta(hours=MONTHLY_WINDOW_HOURS))
+    force = MONTHLY_FORCE and not _monthly_force_done
+    if not in_window and not force:
+        return
+    if in_window:
+        month_id = end_th.strftime("%Y-%m-%d")
+        if sent.get("monthly") == month_id:
+            return
+    else:  # โหมดทดสอบ: นับตั้งแต่จุดเริ่มรอบแรก (หรือต้นรอบปัจจุบัน) ถึงตอนนี้
+        start_th = start_th if start_th is not None else pd.Timestamp(MONTHLY_START_TH)
+        end_th = now_th
+        month_id = "force"
+
+    if df is None:
+        df = fetch_sheet_df()
+    trades = parse_trades(df)
+    skipped = len(parse_trades.last_problems)
+
+    def mark_done():
+        global _monthly_force_done
+        if in_window:
+            sent["monthly"] = month_id
+            save_state()
+        else:
+            _monthly_force_done = True
+
+    if not trades and not sent.get("ledger"):
+        print("ไม่มีออเดอร์ในชีตและสมุดบันทึก ข้ามสรุปรายเดือน")
+        mark_done()
+        return
+
+    bars = None
+    replay = [t for t in trades if t["exit"] is None]
+    if replay:
+        days = min((now_server() - min(t["time"] for t in replay)).days + 2, 59)   # Yahoo ให้ 5 นาทีได้ไม่เกิน 60 วัน
+        bars = fetch_5m(days)
+        if bars is None:
+            print("ดึงข้อมูล 5 นาทีไม่ได้ ลองสรุปรายเดือนใหม่รอบหน้า")
+            return
+
+    results = merge_with_ledger([evaluate_trade(t, bars) for t in trades])
+
+    start_s = utc_to_server(start_th - pd.Timedelta(hours=7))
+    end_s = utc_to_server(end_th - pd.Timedelta(hours=7))
+    month_res = [r for r in results if r["status"] == "closed" and start_s < r["close_time"] <= end_s]
+    if send_telegram_message(build_monthly_msg(start_th, end_th, start_s, end_s, month_res, results, skipped)):
+        mark_done()
+        print("✅ ส่งสรุปรายเดือนแล้ว")
 
 # ==========================================
 # 🔍 วนตรวจตลาด
@@ -1081,7 +1387,7 @@ def send_heartbeat(df_1h):
 
 
 def check_market():
-    global last_heartbeat_time, sheet_errors, data_errors, sheet_alerted, data_alerted
+    global last_heartbeat_time, sheet_errors, data_errors, sheet_alerted, data_alerted, sheet_last_err
 
     market_open = is_market_open()
     heartbeat_due = time.time() - last_heartbeat_time >= HEARTBEAT_INTERVAL
@@ -1105,6 +1411,10 @@ def check_market():
         maybe_send_weekly()
     except Exception as e:
         print(f"Weekly summary error: {e}")
+    try:
+        maybe_send_monthly()
+    except Exception as e:
+        print(f"Monthly summary error: {e}")
 
     if not market_open:
         print("💤 ตลาดปิด ข้ามรอบนี้")
@@ -1123,13 +1433,18 @@ def check_market():
     levels = get_levels_from_google_sheet()
     if not levels:
         sheet_errors += 1
+        sheet_last_err = getattr(get_levels_from_google_sheet, "last_error", "")
         if sheet_errors >= ERROR_ALERT_AT and not sheet_alerted:
-            send_telegram_message("⚠️ <b>คำเตือนระบบ</b>: อ่าน Google Sheets ไม่ได้ติดต่อกันหลายรอบ ตรวจสอบลิงก์/สิทธิ์การเข้าถึง")
+            send_telegram_message(
+                "⚠️ <b>คำเตือนระบบ</b>: อ่าน Google Sheets ไม่ได้ติดต่อกันหลายรอบ\n"
+                f"🔎 สาเหตุล่าสุด: {html.escape(sheet_last_err)}\nตรวจสอบลิงก์/สิทธิ์/ช่องที่กรอก"
+            )
             sheet_alerted = True
         return
     if sheet_alerted:
-        send_telegram_message("✅ อ่าน Google Sheets กลับมาปกติแล้ว")
-    sheet_errors, sheet_alerted = 0, False
+        prev = f"\n🔎 ปัญหาที่เคยแจ้ง: {html.escape(sheet_last_err)}" if sheet_last_err else ""
+        send_telegram_message("✅ <b>แก้ไขแล้ว</b> อ่าน Google Sheets กลับมาปกติ ช่องที่เคยมีปัญหาอ่านได้แล้ว" + prev)
+    sheet_errors, sheet_alerted, sheet_last_err = 0, False, ""
 
     try:
         monitor_trades(levels)
@@ -1166,9 +1481,11 @@ if __name__ == "__main__":
     threading.Thread(target=watchdog, daemon=True).start()
 
     print("🤖 บอท XAUUSD เริ่มทำงานแล้ว...")
+    store = "☁️ Upstash" if REMOTE_ENABLED else "💾 ไฟล์ในเครื่อง (อาจหายตอน redeploy)"
     send_telegram_message(
         f"🚀 <b>บอท XAUUSD เริ่มทำงานแล้ว</b>\n🕒 เวลา MT5 ตอนนี้: <code>{fmt(now_server())}</code>\n"
-        f"(ถ้าไม่ตรงกับนาฬิกาใน MT5 ให้ปรับ SERVER_UTC_OFFSET_HOURS)"
+        f"(ถ้าไม่ตรงกับนาฬิกาใน MT5 ให้ปรับ SERVER_UTC_OFFSET_HOURS)\n"
+        f"🗂 ที่เก็บสถานะ: {store}"
     )
 
     while True:
