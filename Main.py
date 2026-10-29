@@ -1140,6 +1140,7 @@ def build_daily_msg(day_start, day_res, open_n, skipped=0):
         f"💰 {r_text(s)}",
         f"💵 สุทธิทั้งวัน: <b>{pnl_label(s['sum_pts'])}</b> (เฉลี่ย {s['avg_pts']:+.2f}/ไม้)",
     ]
+    lines += risk_lines(s)
     if open_n:
         lines.append(f"⏳ ไม้ที่ยังเปิดอยู่: {open_n}")
     if skipped:
