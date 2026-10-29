@@ -567,6 +567,7 @@ MONITOR_DAYS = 4                                                   # เฝ้�
 TRADE_ALERT_WINDOW_MIN = int(os.environ.get("TRADE_ALERT_WINDOW_MIN", "20"))
 WEEKLY_FORCE = os.environ.get("WEEKLY_FORCE", "0") == "1"          # ทดสอบ: ส่งสรุปทันที 1 ครั้งต่อการรัน
 _weekly_force_done = False
+_known_exits = None   # {id ไม้: ราคา Exit} ที่บอทเห็นแล้ว (กันแจ้งซ้ำ แต่แจ้งเมื่อกรอก/แก้ Exit ใหม่)
 # แจ้งผลเมื่อกรอก Exit (ปิดมือ) ถ้าเวลาปิดอยู่ภายในกี่นาทีที่ผ่านมา (กันส่งซ้ำของเก่าเมื่อบอทรีสตาร์ท)
 MANUAL_ALERT_WINDOW_MIN = int(os.environ.get("MANUAL_ALERT_WINDOW_MIN", "120"))
 # เวลาในคอลัมน์ Time/ExitTime ของชีต: ค่าว่าง = เวลา MT5 / ตั้ง 7 = เวลาไทย (UTC+7)
@@ -857,15 +858,21 @@ def trade_alert_msg(t, r):
 
 def manual_alert_msg(t, r):
     side_u = "BUY" if t["side"] == "buy" else "SELL"
-    diff = r["pts"]
     icon, word = {"win": ("✅", "ชนะ"), "loss": ("❌", "แพ้"), "be": ("➖", "เสมอ")}[r["result"]]
-    return "\n".join([
+    if t["exit_time"] is not None:
+        when = f"🕒 เข้า {fmt(t['time'])} → ปิด {fmt(r['close_time'])} (เวลา MT5)"
+    else:
+        when = f"🕒 เข้า {fmt(t['time'])} → ปิด (ไม่ได้กรอก ExitTime)"
+    lines = [
         f"{icon} <b>ปิดไม้เอง - {side_u} ({word})</b>",
-        f"🕒 เข้า {fmt(t['time'])} → ปิด {fmt(r['close_time'])} (เวลา MT5)",
+        when,
         f"เข้า <code>{t['entry']:.2f}</code> | ปิด <code>{t['exit']:.2f}</code>",
         f"SL <code>{t['sl']:.2f}</code> | TP <code>{t['tp']:.2f}</code>",
-        f"ผล <b>{r_part(r)}</b> ({diff:+.2f} จุดราคา)",
-    ])
+        f"ผล <b>{r_part(r)}</b> ({r['pts']:+.2f} จุดราคา)",
+    ]
+    if t["exit_time"] is None:
+        lines.append("💡 ใส่ ExitTime ในชีต เพื่อให้สถิติรายวันนับถูกวัน")
+    return "\n".join(lines)
 
 
 def day_bounds(ts):
@@ -921,21 +928,30 @@ def monitor_trades(levels):
                  f"⚠️ <b>ออเดอร์ในชีตแถว {t['row']}</b> มีเวลาเข้าไม้ {fmt(t['time'])} (เวลา MT5) อยู่ในอนาคต\n"
                  f"บอทจึงยังไม่นับผล เช็กวันที่/เวลาที่กรอก")
 
+    global _known_exits
     pairs, _ = collect_results(levels.get("trades", []))
     all_r = [r for _, r in pairs]
+    window = timedelta(minutes=MANUAL_ALERT_WINDOW_MIN)
+    if _known_exits is None:  # เพิ่งสตาร์ทบอท: Exit เก่าที่มีอยู่แล้วถือว่าแจ้งไปแล้ว (กันส่งซ้ำของเก่า)
+        _known_exits = {t["id"]: t["exit"] for t, r in pairs
+                        if r["status"] == "closed" and r["how"] == "manual" and now - r["close_time"] > window}
     for t, r in pairs:
         if r["status"] != "closed":
             continue
         age = now - r["close_time"]
+        key, val = f"trade:{t['id']}", None
         if r["how"] == "manual":
-            if age > timedelta(minutes=MANUAL_ALERT_WINDOW_MIN):
+            is_new = _known_exits.get(t["id"]) != t["exit"]   # เพิ่งกรอก/แก้ Exit (ไม่ขึ้นกับ ExitTime)
+            if not is_new and age > window:
                 continue
             msg, val = manual_alert_msg(t, r), f"manual:{t['exit']:g}"
         else:
             if age > timedelta(minutes=TRADE_ALERT_WINDOW_MIN):
                 continue
             msg, val = trade_alert_msg(t, r), r["how"]
-        fire(f"trade:{t['id']}", val, msg + tally_text(all_r, r["close_time"]))
+        fire(key, val, msg + tally_text(all_r, r["close_time"]))
+        if r["how"] == "manual" and sent.get(key) == val:
+            _known_exits[t["id"]] = t["exit"]
 
 
 def build_daily_msg(day_start, day_res, open_n, skipped=0):
