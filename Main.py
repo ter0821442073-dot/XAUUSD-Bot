@@ -1451,6 +1451,66 @@ def maybe_send_monthly(df=None):
 # ==========================================
 H4_CLOSE_ALERT = os.environ.get("H4_CLOSE_ALERT", "1") == "1"
 H4_CLOSE_WINDOW_MIN = int(os.environ.get("H4_CLOSE_WINDOW_MIN", "60"))  # แจ้งเฉพาะแท่งที่ปิดไม่เกินกี่นาที
+PIN_WICK_RATIO = float(os.environ.get("PIN_WICK_RATIO", "2"))      # Pinbar: ไส้หลักต้องยาว >= กี่เท่าของตัวแท่ง
+PIN_WICK_PCT = float(os.environ.get("PIN_WICK_PCT", "0.6"))        # Pinbar: ไส้หลักต้องยาว >= กี่ส่วนของช่วงแท่ง
+PIN_OPP_PCT = float(os.environ.get("PIN_OPP_PCT", "0.25"))         # Pinbar: ไส้ฝั่งตรงข้ามต้องสั้น <= กี่ส่วนของช่วงแท่ง
+DOJI_BODY_PCT = float(os.environ.get("DOJI_BODY_PCT", "0.10"))     # Doji: ตัวแท่ง <= กี่ส่วนของช่วงแท่ง
+MARU_BODY_PCT = float(os.environ.get("MARU_BODY_PCT", "0.85"))     # Marubozu: ตัวแท่ง >= กี่ส่วนของช่วงแท่ง
+
+
+def candle_patterns(prev, cur, k=None):
+    """จำแนกลักษณะแท่ง คืนรายการข้อความ (prev/cur = (O, H, L, C), k = Stoch %K ของแท่งนี้)"""
+    po, ph, pl, pc = prev
+    o, h, l, c = cur
+    rng = h - l
+    if rng <= 0:
+        return ["แท่งไม่มีช่วงราคา"]
+    body = abs(c - o)
+    body_s = max(body, 0.01)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+    has_k = k is not None and not pd.isna(k)
+    pats = []
+
+    # Pinbar (ไส้ยาวปฏิเสธราคา)
+    bull_pin = lower >= PIN_WICK_RATIO * body_s and lower >= PIN_WICK_PCT * rng and upper <= PIN_OPP_PCT * rng
+    bear_pin = upper >= PIN_WICK_RATIO * body_s and upper >= PIN_WICK_PCT * rng and lower <= PIN_OPP_PCT * rng
+    if bull_pin:
+        t = f"📌 Pinbar ขาขึ้น (Hammer) ไส้ล่างยาว {lower / rng:.0%} ของแท่ง"
+        if has_k and k <= 20:
+            t += " + ตรงโซน Oversold"
+        pats.append(t)
+    elif bear_pin:
+        t = f"📌 Pinbar ขาลง (Shooting Star) ไส้บนยาว {upper / rng:.0%} ของแท่ง"
+        if has_k and k >= 80:
+            t += " + ตรงโซน Overbought"
+        pats.append(t)
+
+    # Doji / Marubozu / Spinning top
+    if body <= DOJI_BODY_PCT * rng:
+        if not (bull_pin or bear_pin):
+            pats.append("➖ Doji (ตลาดลังเล)")
+    elif body >= MARU_BODY_PCT * rng:
+        pats.append("🟩 Marubozu ขาขึ้น (ซื้อแรงตลอดแท่ง)" if c > o else "🟥 Marubozu ขาลง (ขายแรงตลอดแท่ง)")
+    elif body <= 0.3 * rng and upper >= 0.25 * rng and lower >= 0.25 * rng:
+        pats.append("🌀 Spinning Top (แรงซื้อขายสูสี)")
+
+    # Engulfing
+    engulf = False
+    if pc < po and c > o and c >= po and o <= pc + ENGULF_TOL:
+        pats.append("🟢 Bullish Engulfing (กลืนกินขาขึ้น)")
+        engulf = True
+    elif pc > po and c < o and c <= po and o >= pc - ENGULF_TOL:
+        pats.append("🔴 Bearish Engulfing (กลืนกินขาลง)")
+        engulf = True
+
+    # Inside / Outside bar
+    if h <= ph and l >= pl:
+        pats.append("📦 Inside Bar (ราคาพักตัวในกรอบแท่งก่อนหน้า)")
+    elif h > ph and l < pl and not engulf:
+        pats.append("↕️ Outside Bar (ทำ High/Low ใหม่ทั้งสองฝั่ง)")
+
+    return pats or ["แท่งทั่วไป (ไม่เข้ารูปแบบเด่น)"]
 
 
 def maybe_send_h4_close(df_1h, df_4h):
@@ -1507,6 +1567,8 @@ def maybe_send_h4_close(df_1h, df_4h):
     else:
         zone = "↔️ อยู่ระหว่างโซน"
 
+    pats = candle_patterns(ohlc(df_4h, closed_i - 1), (o, h, l, c), k)
+
     lines = [
         "🕓 <b>4H ปิดแท่งแล้ว</b>",
         f"📊 XAUUSD ({SYMBOL}) | แท่ง {fmt(start)} → {fmt(end)} (เวลา MT5)",
@@ -1514,6 +1576,8 @@ def maybe_send_h4_close(df_1h, df_4h):
         f"O <code>{px(o):.2f}</code> | H <code>{px(h):.2f}</code>",
         f"L <code>{px(l):.2f}</code> | C <code>{px(c):.2f}</code>",
         f"📏 ช่วงแท่ง {rng:.2f} | ตัว {body:.2f} | ไส้บน {upper:.2f} | ไส้ล่าง {lower:.2f}",
+        "🔎 <b>ลักษณะแท่ง</b>",
+        *pats,
         f"📉 Stoch %K: <code>{kp_txt}</code> ➡️ <code>{k_txt}</code> {zone}",
     ]
     if not pd.isna(a):
