@@ -1447,6 +1447,83 @@ def maybe_send_monthly(df=None):
         print("✅ ส่งสรุปรายเดือนแล้ว")
 
 # ==========================================
+# 🕓 แจ้งเตือน 4H ปิดแท่ง (ส่งข้อมูลแท่งนั้นเข้า Telegram)
+# ==========================================
+H4_CLOSE_ALERT = os.environ.get("H4_CLOSE_ALERT", "1") == "1"
+H4_CLOSE_WINDOW_MIN = int(os.environ.get("H4_CLOSE_WINDOW_MIN", "60"))  # แจ้งเฉพาะแท่งที่ปิดไม่เกินกี่นาที
+
+
+def maybe_send_h4_close(df_1h, df_4h):
+    """4H ปิดแท่ง: ส่งข้อมูลแท่งนั้นเข้า Telegram (ครั้งเดียวต่อแท่ง)"""
+    if not H4_CLOSE_ALERT or len(df_4h) < 25:
+        return
+    delta = pd.Timedelta(hours=4)
+    now = now_server()
+    last_1h_start = df_1h.index[-1]
+
+    closed_i = None
+    for i in (-1, -2):
+        end = df_4h.index[i] + delta
+        if end > now:
+            continue  # ยังไม่ปิด
+        if i == -1 and last_1h_start < end - pd.Timedelta(hours=1):
+            continue  # ข้อมูล 1H ชั่วโมงสุดท้ายยังมาไม่ครบ
+        closed_i = i
+        break
+    if closed_i is None:
+        return
+
+    start = df_4h.index[closed_i]
+    end = start + delta
+    if now - end > pd.Timedelta(minutes=H4_CLOSE_WINDOW_MIN):
+        return
+
+    stoch_k = calculate_stoch(df_4h)
+    atr = calculate_atr(df_4h)
+    o, h, l, c = ohlc(df_4h, closed_i)
+    k = float(stoch_k.iloc[closed_i])
+    k_prev = float(stoch_k.iloc[closed_i - 1])
+    a = float(atr.iloc[closed_i])
+
+    if c > o:
+        candle = "🟢 แท่งเขียว (ขึ้น)"
+    elif c < o:
+        candle = "🔴 แท่งแดง (ลง)"
+    else:
+        candle = "⚪ โดจิ"
+    body = abs(c - o)
+    rng = h - l
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+
+    k_txt = "-" if pd.isna(k) else f"{k:.1f}"
+    kp_txt = "-" if pd.isna(k_prev) else f"{k_prev:.1f}"
+    if pd.isna(k):
+        zone = ""
+    elif k >= 80:
+        zone = "🔥 Overbought (≥80)"
+    elif k <= 20:
+        zone = "🧊 Oversold (≤20)"
+    else:
+        zone = "↔️ อยู่ระหว่างโซน"
+
+    lines = [
+        "🕓 <b>4H ปิดแท่งแล้ว</b>",
+        f"📊 XAUUSD ({SYMBOL}) | แท่ง {fmt(start)} → {fmt(end)} (เวลา MT5)",
+        candle,
+        f"O <code>{px(o):.2f}</code> | H <code>{px(h):.2f}</code>",
+        f"L <code>{px(l):.2f}</code> | C <code>{px(c):.2f}</code>",
+        f"📏 ช่วงแท่ง {rng:.2f} | ตัว {body:.2f} | ไส้บน {upper:.2f} | ไส้ล่าง {lower:.2f}",
+        f"📉 Stoch %K: <code>{kp_txt}</code> ➡️ <code>{k_txt}</code> {zone}",
+    ]
+    if not pd.isna(a):
+        lines.append(f"🌊 ATR({ATR_PERIOD}): <code>{a:.2f}</code>")
+    if PRICE_OFFSET:
+        lines.append(f"ℹ️ ราคาแสดงเป็นระดับ MT5 (GC=F − {PRICE_OFFSET:g})")
+
+    fire("4h:bar_close", str(start), "\n".join(lines))
+
+# ==========================================
 # 🔍 วนตรวจตลาด
 # ==========================================
 def send_heartbeat(df_1h):
@@ -1503,6 +1580,12 @@ def check_market():
     if data_alerted:
         send_telegram_message("✅ ดึงข้อมูลกราฟกลับมาปกติแล้ว")
     data_errors, data_alerted = 0, False
+
+    # แจ้งเตือน 4H ปิดแท่ง (ไม่ขึ้นกับ Google Sheets)
+    try:
+        maybe_send_h4_close(df_1h, to_4h(df_1h))
+    except Exception as e:
+        print(f"H4 close alert error: {e}")
 
     levels = get_levels_from_google_sheet()
     if not levels:
