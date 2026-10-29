@@ -818,6 +818,7 @@ def summarize(results):
         "gp": gross_p, "gl": gross_l,
         "pf": (gross_p / gross_l) if gross_l > 0 else None,
         "mdd": mdd,
+        "rf": (sum_pts / mdd) if mdd > 0 else None,
     }
 
 
@@ -843,6 +844,28 @@ def risk_lines(s):
         f"⚖️ Profit Factor: <b>{pf_text(s)}</b> (กำไรรวม {s['gp']:.2f} / ขาดทุนรวม {s['gl']:.2f})",
         f"📉 Max Drawdown: <b>{s['mdd']:.2f} จุดราคา</b>",
     ]
+
+
+def rf_text(s):
+    if s["rf"] is None:
+        return "- (ไม่มี Drawdown)"
+    return f"{s['rf']:.2f}"
+
+
+def compare_text(cur, prev, label):
+    """เทียบกับรอบก่อน (ไม่แสดงถ้ารอบก่อนไม่มีไม้)"""
+    if not prev["n"]:
+        return ""
+    d = cur["sum_pts"] - prev["sum_pts"]
+    arrow = "▲" if d > 0.005 else "▼" if d < -0.005 else "▬"
+    lines = [
+        f"🔄 <b>เทียบ{label}ก่อน</b> ({prev['n']} ไม้)",
+        f"💵 สุทธิ {cur['sum_pts']:+.2f} (ก่อนหน้า {prev['sum_pts']:+.2f}) {arrow} {d:+.2f} จุด",
+        f"🎯 WR {cur['wr']:.0f}% (ก่อนหน้า {prev['wr']:.0f}%)",
+    ]
+    if cur["pf"] is not None and prev["pf"] is not None:
+        lines.append(f"⚖️ PF {cur['pf']:.2f} (ก่อนหน้า {prev['pf']:.2f})")
+    return "\n".join(lines)
 
 
 def pnl_label(pts):
@@ -920,7 +943,7 @@ def backfill_ledger(trades):
     print(f"📒 backfill สมุดบันทึกผลแล้ว ({len(todo)} ไม้ที่ตรวจ)")
 
 
-def build_weekly_msg(start_s, end_s, week_res, all_res, skipped=0):
+def build_weekly_msg(start_s, end_s, week_res, all_res, skipped=0, prev_res=None):
     ws, al = summarize(week_res), summarize(all_res)
     lines = [
         "📊 <b>สรุปผลเทรดประจำสัปดาห์ (ตลาดปิดแล้ว)</b>",
@@ -939,6 +962,9 @@ def build_weekly_msg(start_s, end_s, week_res, all_res, skipped=0):
         lines += risk_lines(ws)
     else:
         lines.append("📌 สัปดาห์นี้ไม่มีไม้ที่ปิด")
+    cmp_txt = compare_text(ws, summarize(prev_res or []), "สัปดาห์")
+    if cmp_txt:
+        lines += ["", cmp_txt]
     amb = sum(1 for r in week_res if r.get("ambiguous"))
     if amb:
         lines.append(f"⚠️ {amb} ไม้ SL กับ TP อยู่ในแท่ง 5 นาทีเดียวกัน นับเป็นแพ้")
@@ -1051,6 +1077,38 @@ def collect_results(trades, bars_needed_days=MONITOR_DAYS):
     return out, ok
 
 
+LOSS_STREAK_ALERT = int(os.environ.get("LOSS_STREAK_ALERT", "3"))              # แพ้ติดกันกี่ไม้ถึงเตือน (0 = ปิด)
+STREAK_ALERT_WINDOW_MIN = int(os.environ.get("STREAK_ALERT_WINDOW_MIN", "120"))  # เตือนเฉพาะถ้าไม้ล่าสุดปิดภายในกี่นาที
+
+
+def check_loss_streak(results):
+    """เตือนเมื่อแพ้ติดกันถึงเกณฑ์ (ไม้เสมอไม่ตัดและไม่นับ, ไม้ชนะตัดสถิติ) เตือนอีกเมื่อแพ้เพิ่ม"""
+    if LOSS_STREAK_ALERT <= 0:
+        return
+    closed = sorted([r for r in merge_with_ledger(results) if r["status"] == "closed"],
+                    key=lambda r: r["close_time"])
+    streak = []
+    for r in reversed(closed):
+        if r["result"] == "loss":
+            streak.append(r)
+        elif r["result"] == "be":
+            continue
+        else:
+            break
+    n = len(streak)
+    if n < LOSS_STREAK_ALERT:
+        return
+    last = streak[0]
+    if now_server() - last["close_time"] > timedelta(minutes=STREAK_ALERT_WINDOW_MIN):
+        return
+    total = sum(r["pts"] for r in streak)
+    fire("streak", f"{n}|{last['id']}",
+         f"🚨 <b>แพ้ติดกัน {n} ไม้</b>\n"
+         f"📉 รวม <b>{total:+.2f}</b> จุดราคา\n"
+         f"🕒 ไม้ล่าสุดปิด {fmt(last['close_time'])} (เวลา MT5)\n"
+         f"💡 พักสักครู่ ทบทวนแผน หรือลดขนาดไม้ก่อนเข้าไม้ถัดไป")
+
+
 def notify_recovered(levels, cur_bad, cur_future):
     """แจ้งเมื่อแถวที่เคยเตือนว่ามีปัญหา ถูกแก้ไขแล้ว"""
     valid_rows = {t["row"] for t in levels.get("trades", [])}
@@ -1121,6 +1179,11 @@ def monitor_trades(levels):
         fire(key, val, msg + tally_text(all_r, r["close_time"]))
         if r["how"] == "manual" and sent.get(key) == val:
             _known_exits[t["id"]] = t["exit"]
+
+    try:
+        check_loss_streak(all_r)
+    except Exception as e:
+        print(f"Loss streak error: {e}")
 
     try:
         backfill_ledger(levels.get("trades", []))
@@ -1236,8 +1299,10 @@ def maybe_send_weekly(now_utc=None, df=None):
     results = merge_with_ledger([evaluate_trade(t, bars) for t in trades])
     start_s, end_s = utc_to_server(start_utc), utc_to_server(end_utc)
     week_res = [r for r in results if r["status"] == "closed" and start_s < r["close_time"] <= end_s]
+    prev_start_s = utc_to_server(start_utc - timedelta(days=7))
+    prev_res = [r for r in results if r["status"] == "closed" and prev_start_s < r["close_time"] <= start_s]
     if send_telegram_message(build_weekly_msg(start_s, end_s, week_res, results,
-                                              skipped=len(parse_trades.last_problems))):
+                                              skipped=len(parse_trades.last_problems), prev_res=prev_res)):
         mark_done()
         print("✅ ส่งสรุปรายสัปดาห์แล้ว")
 
@@ -1266,7 +1331,7 @@ def monthly_bounds(now_th):
     return start, end
 
 
-def build_monthly_msg(start_th, end_th, start_s, end_s, month_res, all_res, skipped=0):
+def build_monthly_msg(start_th, end_th, start_s, end_s, month_res, all_res, skipped=0, prev_res=None):
     s = summarize(month_res)
     lines = ["🗓 <b>สรุปผลเทรดประจำเดือน</b>",
              f"📆 {start_th:%d/%m/%Y %H:%M} → {end_th:%d/%m/%Y %H:%M} (เวลาไทย)", ""]
@@ -1282,6 +1347,7 @@ def build_monthly_msg(start_th, end_th, start_s, end_s, month_res, all_res, skip
             f"💵 สุทธิ: <b>{pnl_label(s['sum_pts'])}</b> (เฉลี่ย {s['avg_pts']:+.2f}/ไม้)",
         ]
         lines += risk_lines(s)
+        lines.append(f"🔁 Recovery Factor: <b>{rf_text(s)}</b> (กำไรสุทธิ ÷ Max Drawdown)")
         lines.append("")
         for side, name in (("buy", "BUY"), ("sell", "SELL")):
             x = summarize([r for r in month_res if r["side"] == side])
@@ -1310,6 +1376,9 @@ def build_monthly_msg(start_th, end_th, start_s, end_s, month_res, all_res, skip
         ]
     open_n = sum(1 for r in all_res if r["status"] == "open")
     unknown_n = sum(1 for r in all_res if r["status"] == "unknown")
+    cmp_txt = compare_text(s, summarize(prev_res or []), "เดือน")
+    if cmp_txt:
+        lines += ["", cmp_txt]
     if open_n:
         lines.append(f"⏳ ไม้ที่ยังเปิดอยู่: {open_n}")
     if unknown_n:
@@ -1369,7 +1438,11 @@ def maybe_send_monthly(df=None):
     start_s = utc_to_server(start_th - pd.Timedelta(hours=7))
     end_s = utc_to_server(end_th - pd.Timedelta(hours=7))
     month_res = [r for r in results if r["status"] == "closed" and start_s < r["close_time"] <= end_s]
-    if send_telegram_message(build_monthly_msg(start_th, end_th, start_s, end_s, month_res, results, skipped)):
+    prev_start_th = start_th - pd.DateOffset(months=1)
+    prev_start_s = utc_to_server(prev_start_th - pd.Timedelta(hours=7))
+    prev_res = [r for r in results if r["status"] == "closed" and prev_start_s < r["close_time"] <= start_s]
+    if send_telegram_message(build_monthly_msg(start_th, end_th, start_s, end_s, month_res, results,
+                                               skipped, prev_res=prev_res)):
         mark_done()
         print("✅ ส่งสรุปรายเดือนแล้ว")
 
