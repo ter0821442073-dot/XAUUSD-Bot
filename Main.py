@@ -223,7 +223,7 @@ def read_levels(df, col):
         raise ValueError(f"ไม่พบคอลัมน์ {col} ในชีต")
     vals = pd.to_numeric(df[col].astype(str).str.replace(",", ""), errors="coerce").dropna()
     if vals.empty:
-        raise ValueError(f"คอลัมน์ {col} ไม่มีตัวเลข")
+        print(f"ℹ️ คอลัมน์ {col} ไม่มีแนว (ว่าง)")   # ว่างได้ เพราะแนวที่เบรกแล้วถูกลบออกจากชีตอัตโนมัติ
     return sorted(float(v) for v in vals)
 
 
@@ -252,6 +252,7 @@ def get_levels_from_google_sheet():
             "trades_ok": trades_ok,
             "problems": problems,
         }
+        apply_removed(result)
         get_levels_from_google_sheet.last_error = ""
         return result
     except Exception as e:
@@ -1588,6 +1589,171 @@ def maybe_send_h4_close(df_1h, df_4h):
     fire("4h:bar_close", str(start), "\n".join(lines))
 
 # ==========================================
+# 💥 ปิดแท่งเบรกแนวต้าน/แนวรับ (H1, H4) + ลบแนวที่เบรกออกจากชีตอัตโนมัติ
+# เบรกขึ้น: ปิดแท่งเหนือแนวต้าน (แท่งก่อนหน้าปิดใต้แนว) / เบรกลง: ปิดแท่งใต้แนวรับ (แท่งก่อนหน้าปิดเหนือแนว)
+# แนวที่เบรกแล้วเลิกใช้ทันที (ไม่ใช้เป็นแนวรับ/ต้านเก่า) และสั่งลบออกจากชีตผ่าน Google Apps Script (SHEET_WEBHOOK_URL)
+# ลบเฉพาะคอลัมน์ของ TF นั้น (เช่น เบรกต้าน H1 ลบจาก 1H_Res)
+# ==========================================
+BREAK_ALERT = os.environ.get("BREAK_ALERT", "1") == "1"
+BREAK_AUTO_REMOVE = os.environ.get("BREAK_AUTO_REMOVE", "1") == "1"
+BREAK_WINDOW_MIN = int(os.environ.get("BREAK_WINDOW_MIN", "90"))   # ตรวจแท่งที่ปิดไม่เกินกี่นาที (กันส่งซ้ำตอนรีสตาร์ท)
+SHEET_WEBHOOK_URL = os.environ.get("SHEET_WEBHOOK_URL", "").strip()
+SHEET_WEBHOOK_SECRET = os.environ.get("SHEET_WEBHOOK_SECRET", "").strip()
+
+
+def sheet_col(tf, kind):
+    return f"{tf.upper()}_{'Res' if kind == 'res' else 'Sup'}"
+
+
+def register_removal(tf, kind, raw):
+    """จดแนวที่เบรกแล้ว (ค่าตามชีต) รอลบออกจากชีต บอทเลิกใช้แนวนี้ทันที"""
+    pend = sent.setdefault("pending_remove", {})
+    key = f"{sheet_col(tf, kind)}:{raw:.2f}"
+    if key in pend:
+        return
+    pend[key] = {"tf": tf, "kind": kind, "val": raw, "t": str(now_server())}
+    save_state()
+
+
+def apply_removed(levels):
+    """ตัดแนวที่เบรกแล้วออกจากรายการที่บอทใช้ / เลิกจำเมื่อค่านั้นหายจากชีตแล้ว (ลบสำเร็จหรือลบเอง)"""
+    pend = sent.get("pending_remove")
+    if not pend:
+        return
+    changed = False
+    for key, e in list(pend.items()):
+        if not any(abs(v - e["val"]) < 0.005 for v in levels[e["tf"]][e["kind"]]):
+            pend.pop(key, None)
+            changed = True
+    for tf in ("1h", "4h"):
+        for kind in ("res", "sup"):
+            drop = [e["val"] for e in pend.values() if e["tf"] == tf and e["kind"] == kind]
+            if drop:
+                levels[tf][kind] = [v for v in levels[tf][kind] if not any(abs(v - d) < 0.005 for d in drop)]
+    if changed:
+        save_state()
+
+
+def push_removals():
+    """สั่งลบแนวที่เบรกแล้วออกจากชีตผ่าน Apps Script (ลองใหม่ทุกรอบถ้ายังไม่สำเร็จ)"""
+    pend = sent.get("pending_remove")
+    if not pend or not SHEET_WEBHOOK_URL:
+        return
+    changed = False
+    for e in pend.values():
+        if e.get("pushed"):
+            continue
+        col = sheet_col(e["tf"], e["kind"])
+        try:
+            r = requests.post(SHEET_WEBHOOK_URL,
+                              json={"secret": SHEET_WEBHOOK_SECRET, "column": col, "value": e["val"]},
+                              timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            if not data.get("ok"):
+                raise ValueError(data.get("error", "unknown"))
+            e["pushed"] = True
+            changed = True
+            print(f"🧹 ลบแนว {e['val']:.2f} ออกจาก {col} แล้ว (removed={data.get('removed')})")
+        except Exception as ex:
+            e["fails"] = e.get("fails", 0) + 1
+            changed = True
+            print(f"⚠️ ลบแนว {e['val']:.2f} ออกจาก {col} ไม่สำเร็จ ({e['fails']}): {ex}")
+            if e["fails"] == 3:
+                send_telegram_message(
+                    f"⚠️ <b>ลบแนว {e['val']:.2f} ออกจากชีต ({col}) ไม่สำเร็จ</b>\n"
+                    f"🔎 {html.escape(str(ex))}\n"
+                    f"บอทเลิกใช้แนวนี้แล้ว แต่ต้องลบในชีตเอง หรือตรวจ SHEET_WEBHOOK_URL / SECRET / การ Deploy Apps Script"
+                )
+    if changed:
+        save_state()
+
+
+def closed_bar_index(tf, df, last_1h_start):
+    """ตำแหน่งแท่งที่ปิดแล้วล่าสุด (ตรรกะเดียวกับ check_timeframe) คืน None ถ้าข้อมูลยังไม่พร้อม"""
+    delta = pd.Timedelta(hours=1 if tf == "1h" else 4)
+    last_end = df.index[-1] + delta
+    is_live = last_end + pd.Timedelta(seconds=CLOSE_GRACE_SEC) > now_server()
+    if not is_live and tf == "4h" and last_1h_start < last_end - pd.Timedelta(hours=1):
+        return None
+    return -2 if is_live else -1
+
+
+def check_breaks(tf, df, levels, last_1h_start):
+    if not (BREAK_ALERT or BREAK_AUTO_REMOVE) or len(df) < 25:
+        return
+    cl_i = closed_bar_index(tf, df, last_1h_start)
+    if cl_i is None:
+        return
+
+    delta = pd.Timedelta(hours=1 if tf == "1h" else 4)
+    bar_start = df.index[cl_i]
+    if now_server() - (bar_start + delta) > pd.Timedelta(minutes=BREAK_WINDOW_MIN):
+        return
+
+    o, h, l, c = ohlc(df, cl_i)
+    po, ph, pl, pc = ohlc(df, cl_i - 1)
+    res_list = [v + PRICE_OFFSET for v in levels[tf]["res"]]
+    sup_list = [v + PRICE_OFFSET for v in levels[tf]["sup"]]
+    up = [r for r in res_list if pc <= r < c]      # แนวต้านที่ปิดทะลุขึ้น
+    down = [s for s in sup_list if c < s <= pc]    # แนวรับที่ปิดทะลุลง
+    if not up and not down:
+        return
+
+    a = float(calculate_atr(df).iloc[cl_i])
+    k = float(calculate_stoch(df).iloc[cl_i])
+    tf_u = tf.upper()
+    cid = str(bar_start)
+    clabel = fmt(bar_start)
+    risk = risk_notes(levels.get("news", []))
+    pats = candle_patterns((po, ph, pl, pc), (o, h, l, c), k)
+    k_txt = "-" if pd.isna(k) else f"{k:.1f}"
+    rng = h - l
+    body_pct = (abs(c - o) / rng) if rng > 0 else 0.0
+
+    for side, hit in (("buy", up), ("sell", down)):
+        if not hit:
+            continue
+        kind = "res" if side == "buy" else "sup"
+        key = f"{tf}:break_{'up' if side == 'buy' else 'down'}"
+        ok = (sent.get(key) == cid) or not BREAK_ALERT
+
+        if BREAK_ALERT and not ok:
+            names = ", ".join(f"{px(v):.2f}" for v in sorted(hit))
+            if side == "buy":
+                top = max(hit)
+                title = f"💥 <b>ปิดแท่งเบรกแนวต้านขึ้น - TF {tf_u}</b>"
+                lines = [
+                    f"🔓 แนวต้านที่เบรก: <code>{names}</code>",
+                    f"💵 ราคาปิด: <code>{px(c):.2f}</code> (เหนือแนว {c - top:.2f}) | ก่อนหน้าปิด <code>{px(pc):.2f}</code>",
+                ]
+                weak = c < o or body_pct < 0.4
+            else:
+                top = min(hit)
+                title = f"💥 <b>ปิดแท่งเบรกแนวรับลง - TF {tf_u}</b>"
+                lines = [
+                    f"🔓 แนวรับที่เบรก: <code>{names}</code>",
+                    f"💵 ราคาปิด: <code>{px(c):.2f}</code> (ใต้แนว {top - c:.2f}) | ก่อนหน้าปิด <code>{px(pc):.2f}</code>",
+                ]
+                weak = c > o or body_pct < 0.4
+            lines.append(f"📏 ตัวแท่ง {body_pct:.0%} ของช่วงแท่ง | Stoch %K: <code>{k_txt}</code>")
+            if weak:
+                lines.append("⚠️ แท่งเบรกไม่แข็งแรง (ตัวเล็กหรือสีสวนทาง) ระวังเบรกหลอก")
+            lines += ["🔎 <b>ลักษณะแท่ง</b>", *pats]
+            if BREAK_AUTO_REMOVE:
+                if SHEET_WEBHOOK_URL:
+                    lines.append(f"🧹 ลบแนวนี้ออกจากชีต ({sheet_col(tf, kind)}) อัตโนมัติ")
+                else:
+                    lines.append(f"🧹 บอทเลิกใช้แนวนี้แล้ว (ยังไม่ได้ตั้ง SHEET_WEBHOOK_URL ให้ลบในชีต {sheet_col(tf, kind)} เอง)")
+            msg = compose(title, clabel, lines, side, c, a,
+                          next_target(side, c, sup_list, res_list), "", risk)
+            ok = fire(key, cid, msg)
+
+        if ok and BREAK_AUTO_REMOVE:
+            for lvl in hit:
+                register_removal(tf, kind, lvl - PRICE_OFFSET)
+
+# ==========================================
 # 🔍 วนตรวจตลาด
 # ==========================================
 def send_heartbeat(df_1h):
@@ -1682,6 +1848,15 @@ def check_market():
             check_timeframe(tf, df, levels, last_1h_start, k4_now)
         except Exception as e:
             print(f"Error in TF {tf}: {e}")
+        try:
+            check_breaks(tf, df, levels, last_1h_start)
+        except Exception as e:
+            print(f"Break alert error TF {tf}: {e}")
+
+    try:
+        push_removals()
+    except Exception as e:
+        print(f"Push removals error: {e}")
 
 # ==========================================
 # 🐶 Watchdog: ถ้าลูปหลักค้างเกิน WATCHDOG_SEC วินาที ให้ปิดโปรเซส Render จะสตาร์ทใหม่ให้เอง
