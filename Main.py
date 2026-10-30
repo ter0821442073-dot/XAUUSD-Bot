@@ -1684,11 +1684,13 @@ def check_breaks(tf, df, levels, last_1h_start):
         return
     cl_i = closed_bar_index(tf, df, last_1h_start)
     if cl_i is None:
+        print(f"[{tf.upper()}] เช็กเบรก: ข้ามรอบนี้ (ข้อมูล 1H ชั่วโมงสุดท้ายยังมาไม่ครบ)")
         return
 
     delta = pd.Timedelta(hours=1 if tf == "1h" else 4)
     bar_start = df.index[cl_i]
     if now_server() - (bar_start + delta) > pd.Timedelta(minutes=BREAK_WINDOW_MIN):
+        print(f"[{tf.upper()}] เช็กเบรก: แท่งปิดล่าสุด {fmt(bar_start)} เก่าเกิน {BREAK_WINDOW_MIN} นาที ข้าม")
         return
 
     o, h, l, c = ohlc(df, cl_i)
@@ -1697,6 +1699,11 @@ def check_breaks(tf, df, levels, last_1h_start):
     sup_list = [v + PRICE_OFFSET for v in levels[tf]["sup"]]
     up = [r for r in res_list if pc <= r < c]      # แนวต้านที่ปิดทะลุขึ้น
     down = [s for s in sup_list if c < s <= pc]    # แนวรับที่ปิดทะลุลง
+    n_res = min((r for r in res_list if r > c), default=None)   # ต้านใกล้สุดเหนือราคาปิด
+    n_sup = max((s for s in sup_list if s < c), default=None)   # รับใกล้สุดใต้ราคาปิด
+    print(f"[{tf.upper()}] เช็กเบรก แท่งปิด {fmt(bar_start)} | C ก่อนหน้า {px(pc):.2f} → C {px(c):.2f} | "
+          f"ต้านถัดไป {'-' if n_res is None else f'{px(n_res):.2f}'} | รับถัดไป {'-' if n_sup is None else f'{px(n_sup):.2f}'} | "
+          f"เบรกต้าน={len(up)} เบรกรับ={len(down)}")
     if not up and not down:
         return
 
