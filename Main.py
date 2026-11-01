@@ -879,6 +879,7 @@ def pnl_label(pts):
 
 
 # ---------- สมุดบันทึกผล (ledger): จำผลไม้ที่ปิดแล้ว แม้ลบแถวในชีตไปแล้ว ----------
+LEDGER_KEEP_DAYS = int(os.environ.get("LEDGER_KEEP_DAYS", "400"))   # เก็บผลไม้ไว้กี่วัน (ต้องเกิน 365 เพื่อทำสรุปรายปี)
 def remember_closed(t, r):
     """เก็บผลไม้ที่ปิดแล้วลงสมุดบันทึก ไว้ใช้สรุปเดือนเมื่อแถวถูกลบออกจากชีต"""
     led = sent.setdefault("ledger", {})
@@ -887,7 +888,7 @@ def remember_closed(t, r):
     if led.get(t["id"]) == entry:
         return
     led[t["id"]] = entry
-    cutoff = now_server() - pd.Timedelta(days=120)
+    cutoff = now_server() - pd.Timedelta(days=LEDGER_KEEP_DAYS)
     for k in [k for k, v in led.items() if pd.Timestamp(v["ct"]) < cutoff]:
         led.pop(k, None)
     save_state()
@@ -1446,6 +1447,156 @@ def maybe_send_monthly(df=None):
                                                skipped, prev_res=prev_res)):
         mark_done()
         print("✅ ส่งสรุปรายเดือนแล้ว")
+
+# ---------- สรุปรายปี (1 ม.ค. 06:00 เวลาไทย) + เคลียร์ข้อมูลปีที่สรุปแล้วใน Upstash ----------
+YEARLY_HOUR_TH = int(os.environ.get("YEARLY_HOUR_TH", "6"))                 # เวลาไทย
+YEARLY_WINDOW_HOURS = int(os.environ.get("YEARLY_WINDOW_HOURS", "24"))      # บอทดับ ส่งย้อนหลังได้ภายในกี่ชม.
+YEARLY_FORCE = os.environ.get("YEARLY_FORCE", "0") == "1"                   # ทดสอบ: ส่งทันที 1 ครั้ง (ไม่ลบข้อมูล)
+_yearly_force_done = False
+
+
+def build_yearly_msg(label, start_th, end_th, year_res, all_res, skipped=0):
+    s = summarize(year_res)
+    lines = [f"🎊 <b>สรุปผลเทรดประจำปี {label}</b>",
+             f"📆 {start_th:%d/%m/%Y} → {end_th:%d/%m/%Y %H:%M} (เวลาไทย)", ""]
+    if not s["n"]:
+        lines.append("📌 ปีนี้ไม่มีไม้ที่ปิด")
+    else:
+        lines += [
+            f"📌 ไม้ที่ปิดทั้งปี: <b>{s['n']}</b> ไม้",
+            f"✅ ชนะ {s['w']} | ❌ แพ้ {s['l']} | ➖ เสมอ {s['be']}",
+            f"🎯 Win rate: <b>{s['wr']:.0f}%</b>",
+            f"📐 RR ที่วางไว้เฉลี่ย: 1:{s['planned']:.2f}" if s["n_pl"] else "📐 RR ที่วางไว้เฉลี่ย: -",
+            f"💰 {r_text(s)}",
+            f"💵 สุทธิทั้งปี: <b>{pnl_label(s['sum_pts'])}</b> (เฉลี่ย {s['avg_pts']:+.2f}/ไม้)",
+        ]
+        lines += risk_lines(s)
+        lines.append(f"🔁 Recovery Factor: <b>{rf_text(s)}</b> (กำไรสุทธิ ÷ Max Drawdown)")
+        lines.append("")
+        for side, name in (("buy", "BUY"), ("sell", "SELL")):
+            x = summarize([r for r in year_res if r["side"] == side])
+            if x["n"]:
+                lines.append(f"{name}: {x['n']} ไม้ | ชนะ {x['w']} แพ้ {x['l']} เสมอ {x['be']} "
+                             f"| WR {x['wr']:.0f}% | {x['sum_pts']:+.2f} จุด")
+        lines += ["", "📅 แยกรายเดือน"]
+        m0 = pd.Timestamp(year=start_th.year, month=start_th.month, day=1)
+        month_stats = []
+        while m0 < end_th:
+            m1 = min(m0 + pd.DateOffset(months=1), end_th)
+            bs = utc_to_server(m0 - pd.Timedelta(hours=7))
+            be = utc_to_server(m1 - pd.Timedelta(hours=7))
+            x = summarize([r for r in year_res if bs < r["close_time"] <= be])
+            if x["n"]:   # ข้ามเดือนที่ไม่มีไม้ (ปีแรกเริ่มเทรดกลางปี)
+                lines.append(f"• {m0:%m/%Y}: {x['n']} ไม้ | ชนะ {x['w']} แพ้ {x['l']} | {x['sum_pts']:+.2f} จุด")
+                month_stats.append((m0, x["sum_pts"]))
+            m0 = m0 + pd.DateOffset(months=1)
+        if month_stats:
+            bm = max(month_stats, key=lambda m: m[1])
+            wm = min(month_stats, key=lambda m: m[1])
+            lines += ["", f"🥇 เดือนที่ดีที่สุด: {bm[0]:%m/%Y} ({bm[1]:+.2f} จุด)",
+                      f"🥀 เดือนที่แย่ที่สุด: {wm[0]:%m/%Y} ({wm[1]:+.2f} จุด)"]
+        best = max(year_res, key=lambda r: r["pts"])
+        worst = min(year_res, key=lambda r: r["pts"])
+        cur = mx = 0
+        for r in sorted(year_res, key=lambda r: r["close_time"]):
+            cur = cur + 1 if r["result"] == "loss" else 0
+            mx = max(mx, cur)
+        lines += [
+            "",
+            f"🏆 ไม้ดีที่สุด: {best['side'].upper()} เข้า {fmt(best['time'])} → {best['pts']:+.2f} จุด",
+            f"💥 ไม้แย่ที่สุด: {worst['side'].upper()} เข้า {fmt(worst['time'])} → {worst['pts']:+.2f} จุด",
+            f"📉 แพ้ติดต่อกันสูงสุด: {mx} ไม้",
+        ]
+    open_n = sum(1 for r in all_res if r["status"] == "open")
+    if open_n:
+        lines.append(f"⏳ ไม้ที่ยังเปิดอยู่: {open_n}")
+    if skipped:
+        lines.append(f"⚠️ มี {skipped} แถวในชีตไม่ถูกนับ (ข้อมูลไม่ถูกต้อง)")
+    return "\n".join(lines)
+
+
+def purge_after_yearly(end_s):
+    """เคลียร์สมุดบันทึกผลไม้ที่สรุปแล้ว (ปิดก่อน end_s) + คีย์เก่าที่ไม่ใช้แล้ว แล้วเขียนสถานะที่เล็กลงทับใน Upstash
+    คงสถานะที่ยังต้องใช้ไว้ (ตัวกันส่งซ้ำของสรุปรายวัน/สัปดาห์/เดือน, ไม้ใหม่หลังสิ้นปี)"""
+    led = sent.get("ledger", {})
+    old = [k for k, v in led.items() if pd.Timestamp(v["ct"]) <= end_s]
+    for k in old:
+        led.pop(k, None)
+        sent.pop(f"trade:{k}", None)
+    cutoff = now_server() - pd.Timedelta(days=7)
+    for k in [k for k in sent if ":cd_" in k]:
+        try:
+            if pd.Timestamp(sent[k]) < cutoff:
+                sent.pop(k, None)
+        except Exception:
+            sent.pop(k, None)
+    pend = sent.get("pending_remove", {})
+    for k in [k for k, e in pend.items() if e.get("pushed")]:
+        pend.pop(k, None)
+    save_state()
+    return len(old)
+
+
+def maybe_send_yearly(df=None):
+    global _yearly_force_done
+    now_th = pd.Timestamp(datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=7))
+    send_at = pd.Timestamp(year=now_th.year, month=1, day=1, hour=YEARLY_HOUR_TH)
+    in_window = pd.Timedelta(0) <= now_th - send_at < pd.Timedelta(hours=YEARLY_WINDOW_HOURS)
+    force = YEARLY_FORCE and not _yearly_force_done
+    if not in_window and not force:
+        return
+    if in_window:
+        start_th = pd.Timestamp(year=now_th.year - 1, month=1, day=1)
+        end_th = pd.Timestamp(year=now_th.year, month=1, day=1)
+        year_id = str(now_th.year - 1)
+        label = year_id
+        if sent.get("yearly") == year_id:
+            return
+    else:  # โหมดทดสอบ: ตั้งแต่ 1 ม.ค. ปีนี้ถึงตอนนี้ และไม่ลบข้อมูลใดๆ
+        start_th = pd.Timestamp(year=now_th.year, month=1, day=1)
+        end_th = now_th
+        year_id = "force"
+        label = f"{now_th.year} (ทดสอบ)"
+
+    if df is None:
+        df = fetch_sheet_df()
+    trades = parse_trades(df)
+    skipped = len(parse_trades.last_problems)
+
+    bars = None
+    replay = [t for t in trades if t["exit"] is None]
+    if replay:
+        days = min((now_server() - min(t["time"] for t in replay)).days + 2, 59)
+        bars = fetch_5m(days)
+        if bars is None:
+            print("ดึงข้อมูล 5 นาทีไม่ได้ ลองสรุปรายปีใหม่รอบหน้า")
+            return
+
+    results = merge_with_ledger([evaluate_trade(t, bars) for t in trades])
+    start_s = utc_to_server(start_th - pd.Timedelta(hours=7))
+    end_s = utc_to_server(end_th - pd.Timedelta(hours=7))
+    year_res = [r for r in results if r["status"] == "closed" and start_s < r["close_time"] <= end_s]
+
+    if not year_res and not trades and not sent.get("ledger"):
+        print("ไม่มีข้อมูลสำหรับสรุปรายปี ข้าม")
+        if in_window:
+            sent["yearly"] = year_id
+            save_state()
+        else:
+            _yearly_force_done = True
+        return
+
+    if not send_telegram_message(build_yearly_msg(label, start_th, end_th, year_res, results, skipped)):
+        return
+    print("✅ ส่งสรุปรายปีแล้ว")
+    if not in_window:
+        _yearly_force_done = True
+        return
+    sent["yearly"] = year_id
+    save_state()   # จดก่อนว่าส่งแล้ว กันส่งซ้ำถ้าขั้นเคลียร์พลาด
+    n = purge_after_yearly(end_s)
+    send_telegram_message(f"🧹 <b>เคลียร์ข้อมูลปี {label} ใน Upstash แล้ว</b>\n"
+                          f"ลบผลไม้ที่สรุปแล้ว {n} ไม้ และคีย์เก่าที่ไม่ใช้แล้ว เริ่มเก็บสถิติปีใหม่จาก 0")
 
 # ==========================================
 # 🕓 แจ้งเตือน 4H ปิดแท่ง (ส่งข้อมูลแท่งนั้นเข้า Telegram)
@@ -2097,6 +2248,10 @@ def check_market():
         maybe_send_monthly()
     except Exception as e:
         print(f"Monthly summary error: {e}")
+    try:
+        maybe_send_yearly()
+    except Exception as e:
+        print(f"Yearly summary error: {e}")
 
     if not market_open:
         print("💤 ตลาดปิด ข้ามรอบนี้")
