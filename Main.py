@@ -2012,6 +2012,25 @@ def check_choch_retrace(df, levels, last_1h_start):
         _structure_alert(df, closed, ev, atr_val, risk)
 
 
+def check_ict_retrace(df, levels, last_1h_start):
+    """ระบบ ICT (แยกจาก SMC): Sweep -> MSS/Displacement -> ย้อนเข้า OTE (+FVG) -> M1 กลับตัว"""
+    if not ICT_ALERT or len(df) < 40:
+        return
+    cl_i = closed_bar_index("4h", df, last_1h_start)
+    if cl_i is None:
+        return
+    closed = df if cl_i == -1 else df.iloc[:-1]
+    events = find_structure(closed, ICT_SWING)
+    atr_val = float(calculate_atr(closed).iloc[-1])
+    if pd.isna(atr_val):
+        return
+    risk = risk_notes(levels.get("news", []))
+    for kind, ev in events.items():
+        if kind == "bos" and not ICT_BOS:
+            continue
+        _structure_alert(df, closed, ev, atr_val, risk, mode="ict")
+
+
 def fetch_1m():
     c = _m1_cache
     if c["df"] is not None and time.time() - c["ts"] < 20:
@@ -2111,9 +2130,120 @@ def find_m1_confirm(side, m1, z_lo, z_hi, tol):
     return None
 
 
-def _structure_alert(df, closed, ev, atr_val, risk):
+# ---------- 🏷 ป้าย ICT Confluence (แสดงต่อท้ายข้อความ ไม่ตัดสัญญาณใดๆ) ----------
+# ระบบ ICT แยกจาก SMC: แจ้งเตือนคนละชุด (key/หัวข้อ/โซนต่างกัน) ใช้ M1 ยืนยันกลับตัวชุดเดียวกัน
+ICT_ALERT = os.environ.get("ICT_ALERT", "1") == "1"                    # 0 = ปิดระบบ ICT ทั้งชุด
+ICT_BOS = os.environ.get("ICT_BOS", "0") == "1"                        # 1 = รวมสัญญาณ BOS (ค่าเริ่มต้นใช้เฉพาะ MSS/CHoCH)
+ICT_SWING = int(os.environ.get("ICT_SWING", "2"))                      # จุดสวิงของ ICT
+ICT_MAX_AGE = int(os.environ.get("ICT_MAX_AGE", "12"))                 # อายุ MSS สูงสุด (แท่ง 4H)
+ICT_FIB = float(os.environ.get("ICT_FIB", "0.62"))                     # ขอบตื้นของ OTE
+ICT_FIB_DEEP = float(os.environ.get("ICT_FIB_DEEP", "0.79"))           # ขอบลึกของ OTE
+ICT_REQUIRE_SWEEP = os.environ.get("ICT_REQUIRE_SWEEP", "1") == "1"    # บังคับ: ต้องกวาดสภาพคล่องก่อน MSS
+ICT_REQUIRE_DISP = os.environ.get("ICT_REQUIRE_DISP", "1") == "1"      # บังคับ: แท่งเบรกต้องวิ่งแรง
+ICT_REQUIRE_FVG = os.environ.get("ICT_REQUIRE_FVG", "1") == "1"        # บังคับ: ต้องมี FVG ซ้อนโซน OTE
+ICT_REQUIRE_PD = os.environ.get("ICT_REQUIRE_PD", "0") == "1"          # บังคับ: Discount (BUY) / Premium (SELL)
+ICT_REQUIRE_KZ = os.environ.get("ICT_REQUIRE_KZ", "0") == "1"          # บังคับ: อยู่ใน Kill Zone
+ICT_SWEEP_LOOKBACK = int(os.environ.get("ICT_SWEEP_LOOKBACK", "10"))   # เทียบสวิงกี่แท่งก่อนหน้าจุดเริ่มขา
+ICT_DISP_ATR = float(os.environ.get("ICT_DISP_ATR", "1.0"))            # แท่งเบรกต้องมีตัวแท่ง >= กี่เท่า ATR ถึงนับว่าวิ่งแรง
+ICT_PD_BARS = int(os.environ.get("ICT_PD_BARS", "60"))                 # กรอบ Premium/Discount ย้อนหลังกี่แท่ง 4H (60 = 10 วัน)
+ICT_KILL_ZONES = os.environ.get("ICT_KILL_ZONES", "London=02:00-05:00,NY AM=07:00-10:00")  # เวลานิวยอร์ก
+
+
+def _parse_kz():
+    out = []
+    for part in ICT_KILL_ZONES.split(","):
+        try:
+            name, rng = part.split("=")
+            a, b = rng.strip().split("-")
+            ah, am = a.split(":")
+            bh, bm = b.split(":")
+            out.append((name.strip(), int(ah) * 60 + int(am), int(bh) * 60 + int(bm)))
+        except Exception:
+            continue
+    return out
+
+
+def ict_confluence(closed, ev, buy, atr_val, z_bot, z_top, start):
+    """คืนบรรทัดป้าย ICT 5 ข้อ: Sweep / Displacement / FVG ซ้อนโซน / Premium-Discount / Kill Zone"""
+    hi, lo = closed["High"].values, closed["Low"].values
+    op, cl = closed["Open"].values, closed["Close"].values
+    n, j = len(closed), ev["idx"]
+    score, rows = 0, []
+
+    # 1) Liquidity Sweep: จุดเริ่มขากวาดสวิงก่อนหน้า แล้วปิดกลับ
+    a = max(0, j - 15)
+    win = lo[a:j + 1] if buy else hi[a:j + 1]
+    k = a + int(abs(win - start).argmin())
+    b0 = max(0, k - ICT_SWEEP_LOOKBACK)
+    swept = False
+    if k > b0:
+        k2 = min(k + 1, n - 1)
+        if buy:
+            ref = float(lo[b0:k].min())
+            swept = lo[k] < ref and max(cl[k], cl[k2]) > ref
+        else:
+            ref = float(hi[b0:k].max())
+            swept = hi[k] > ref and min(cl[k], cl[k2]) < ref
+    if swept:
+        score += 1
+        rows.append(f"✅ Sweep: กวาด{'Low' if buy else 'High'}เดิม <code>{px(ref):.2f}</code> แล้วปิดกลับ")
+    else:
+        rows.append(f"⚠️ Sweep: ไม่พบการกวาด{'Low' if buy else 'High'}ก่อนขานี้")
+
+    # 2) Displacement: แท่งเบรกวิ่งแรงตามทิศ
+    body = abs(cl[j] - op[j])
+    disp = body >= ICT_DISP_ATR * atr_val and ((cl[j] > op[j]) if buy else (cl[j] < op[j]))
+    if disp:
+        score += 1
+        rows.append(f"✅ Displacement: แท่งเบรกตัว {body / atr_val:.1f}×ATR")
+    else:
+        rows.append(f"⚠️ Displacement: แท่งเบรกตัว {body / atr_val:.1f}×ATR (อ่อน)")
+
+    # 3) FVG ที่ซ้อนกับโซน Fib
+    fvg = None
+    for i in range(n - 2, k, -1):
+        g_lo, g_hi = (hi[i - 1], lo[i + 1]) if buy else (hi[i + 1], lo[i - 1])
+        if g_lo < g_hi and g_lo <= z_top and g_hi >= z_bot:
+            fvg = (float(g_lo), float(g_hi))
+            break
+    if fvg:
+        score += 1
+        rows.append(f"✅ FVG ซ้อนโซน: <code>{px(fvg[0]):.2f}</code> – <code>{px(fvg[1]):.2f}</code>")
+    else:
+        rows.append("⚠️ FVG: ไม่มีช่องว่างซ้อนโซน")
+
+    # 4) Premium / Discount ของกรอบใหญ่
+    w = max(0, n - ICT_PD_BARS)
+    mid = (float(hi[w:].max()) + float(lo[w:].min())) / 2
+    zmid = (z_bot + z_top) / 2
+    ok_pd = zmid < mid if buy else zmid > mid
+    zone_name = "Discount" if zmid < mid else "Premium"
+    if ok_pd:
+        score += 1
+        rows.append(f"✅ {zone_name}: โซนอยู่{'ต่ำ' if buy else 'สูง'}กว่าครึ่งกรอบ <code>{px(mid):.2f}</code> (ตรงทิศ {'BUY' if buy else 'SELL'})")
+    else:
+        rows.append(f"⚠️ {zone_name}: โซนอยู่{'สูง' if buy else 'ต่ำ'}กว่าครึ่งกรอบ <code>{px(mid):.2f}</code> (สวนทิศ {'BUY' if buy else 'SELL'})")
+
+    # 5) Kill Zone (เวลานิวยอร์ก)
+    ny = datetime.now(timezone.utc).astimezone(ZoneInfo(NY_TZ))
+    m = ny.hour * 60 + ny.minute
+    kz = next((nm for nm, st, en in _parse_kz() if st <= m < en), None)
+    if kz:
+        score += 1
+        rows.append(f"✅ Kill Zone: {kz}")
+    else:
+        rows.append("⚠️ นอก Kill Zone")
+
+    flags = {"sweep": bool(swept), "disp": bool(disp), "fvg": fvg is not None, "pd": bool(ok_pd), "kz": kz is not None}
+    return [f"🧩 <b>ICT Checklist {score}/5</b>"] + rows, flags
+
+
+def _structure_alert(df, closed, ev, atr_val, risk, mode="smc"):
+    ict = mode == "ict"
+    tag = "ICT" if ict else "SMC"
+    f_lo, f_hi = (ICT_FIB, ICT_FIB_DEEP) if ict else (SMC_FIB, SMC_FIB_DEEP)
     age = len(closed) - 1 - ev["idx"]
-    if age > SMC_MAX_AGE:
+    if age > (ICT_MAX_AGE if ict else SMC_MAX_AGE):
         return
     kind, buy, start = ev["kind"], ev["side"] == "buy", ev["start"]
     name = "CHoCH" if kind == "choch" else "BOS"
@@ -2124,34 +2254,44 @@ def _structure_alert(df, closed, ev, atr_val, risk):
     if buy:
         extreme = float(after["High"].max())
         leg = extreme - start
-        z_top, z_bot = extreme - leg * SMC_FIB, extreme - leg * SMC_FIB_DEEP
+        z_top, z_bot = extreme - leg * f_lo, extreme - leg * f_hi
         broken = float(after["Close"].min()) < start
         near_ok = start < cur <= z_top + near
     else:
         extreme = float(after["Low"].min())
         leg = start - extreme
-        z_bot, z_top = extreme + leg * SMC_FIB, extreme + leg * SMC_FIB_DEEP
+        z_bot, z_top = extreme + leg * f_lo, extreme + leg * f_hi
         broken = float(after["Close"].max()) > start
         near_ok = z_bot - near <= cur < start
 
     ev_label = fmt(df.index[ev["idx"]])
-    print(f"[4H] {name} {'BUY' if buy else 'SELL'} แท่ง {ev_label} | ขา {px(start):.2f}→{px(extreme):.2f} "
+    print(f"[4H {tag}] {name} {'BUY' if buy else 'SELL'} แท่ง {ev_label} | ขา {px(start):.2f}→{px(extreme):.2f} "
           f"| โซน {px(z_bot):.2f}–{px(z_top):.2f} | ราคา {px(cur):.2f} | อายุ {age} แท่ง | ขาพัง={broken} | ใกล้โซน={near_ok}")
     if broken or leg < SMC_MIN_LEG_ATR * atr_val or not near_ok:
         return
     if SKIP_RISK_WINDOWS and risk:
         return
 
+    ict_lines = []
+    if ict:   # เงื่อนไขบังคับของระบบ ICT (ก่อนไปขอข้อมูล M1)
+        ict_lines, fl = ict_confluence(closed, ev, buy, atr_val, z_bot, z_top, start)
+        need = [("sweep", ICT_REQUIRE_SWEEP), ("disp", ICT_REQUIRE_DISP), ("fvg", ICT_REQUIRE_FVG),
+                ("pd", ICT_REQUIRE_PD), ("kz", ICT_REQUIRE_KZ)]
+        missing = [k for k, req in need if req and not fl[k]]
+        if missing:
+            print(f"[4H ICT] {name} {'BUY' if buy else 'SELL'}: ไม่ผ่านเงื่อนไขบังคับ {missing} (ยังไม่แจ้ง)")
+            return
+
     side = ev["side"]
     m1 = None
     if SMC_M1_CONFIRM:
         m1df = fetch_1m()
         if m1df is None:
-            print(f"[4H] {name}: ดึงข้อมูล M1 ไม่ได้ ลองใหม่รอบหน้า")
+            print(f"[4H {tag}] {name}: ดึงข้อมูล M1 ไม่ได้ ลองใหม่รอบหน้า")
             return
         m1 = find_m1_confirm(side, m1df, z_bot, z_top, tol)
         if m1 is None:
-            print(f"[4H] {name} {side}: ราคาใกล้โซน รอแท่ง M1 กลับตัวที่ปิดแล้ว (ยังไม่แจ้ง)")
+            print(f"[4H {tag}] {name} {side}: ราคาใกล้โซน รอแท่ง M1 กลับตัวที่ปิดแล้ว (ยังไม่แจ้ง)")
             return
         entry = m1["b"][3]
     else:
@@ -2161,12 +2301,13 @@ def _structure_alert(df, closed, ev, atr_val, risk):
 
     if kind == "choch":
         s_lbl, e_lbl, brk = ("LL", "จุดสูงสุด", "เหนือ LH") if buy else ("HH", "จุดต่ำสุด", "ใต้ HL")
-        icon, what = "🧭", f"CHoCH {'ขาขึ้น' if buy else 'ขาลง'}"
+        icon, what = ("🎯", f"MSS {'ขาขึ้น' if buy else 'ขาลง'}") if ict else ("🧭", f"CHoCH {'ขาขึ้น' if buy else 'ขาลง'}")
     else:
         s_lbl, e_lbl, brk = ("HL", "จุดสูงสุด", "เหนือ HH") if buy else ("LH", "จุดต่ำสุด", "ใต้ LL")
-        icon, what = "📐", f"BOS {'ขาขึ้น' if buy else 'ขาลง'}"
+        icon, what = ("🎯", f"BOS {'ขาขึ้น' if buy else 'ขาลง'}") if ict else ("📐", f"BOS {'ขาขึ้น' if buy else 'ขาลง'}")
     act = "BUY" if buy else "SELL"
-    title = f"{icon} <b>4H {what} + {'M1 ยืนยัน' if m1 else 'เข้าโซน'} 50–61.8% → {act}</b>"
+    zone_txt = f"{f_lo * 100:g}–{f_hi * 100:g}%"
+    title = f"{icon} <b>[{tag}] 4H {what} + {'M1 ยืนยัน' if m1 else 'เข้าโซน'} {'OTE ' if ict else ''}{zone_txt} → {act}</b>"
 
     if buy:
         sl = start - SMC_SL_ATR * atr_val
@@ -2177,7 +2318,7 @@ def _structure_alert(df, closed, ev, atr_val, risk):
     lines = [
         f"🔓 ปิด{brk} <code>{px(ev['level']):.2f}</code> (แท่ง {ev_label})",
         f"📏 ขา: {s_lbl} <code>{px(start):.2f}</code> → {e_lbl} <code>{px(extreme):.2f}</code> ({leg:.2f} จุด)",
-        f"🎯 โซน {SMC_FIB:.1%}–{SMC_FIB_DEEP:.1%}: <code>{px(z_bot):.2f}</code> – <code>{px(z_top):.2f}</code>",
+        f"🎯 โซน {'OTE ' if ict else ''}{zone_txt}: <code>{px(z_bot):.2f}</code> – <code>{px(z_top):.2f}</code>",
     ]
     sl_t = None
     if m1:
@@ -2194,14 +2335,15 @@ def _structure_alert(df, closed, ev, atr_val, risk):
         lines.append(f"💵 ราคาตอนนี้: <code>{px(cur):.2f}</code>")
         lines.append(f"🛑 SL (เลยจุดเริ่มขา +{SMC_SL_ATR:g}×ATR {atr_val:.2f}): <code>{px(sl):.2f}</code> | R:R 1:{rr:.1f}")
     lines.append(f"🏁 เป้า ({e_lbl}ของขา): <code>{px(extreme):.2f}</code>")
+    lines += ict_lines
     parts = [title, f"📊 XAUUSD ({SYMBOL}) | TF 4H"] + lines + risk
     if PRICE_OFFSET:
         parts.append(f"ℹ️ ราคาแสดงเป็นระดับ MT5 (GC=F − {PRICE_OFFSET:g})")
     parts.append("📱 <b>เปิด MT5 เช็กกราฟก่อนตัดสินใจ</b>")
-    key = f"4h:{kind}_{side}" + ("_m1" if m1 else "")
+    key = f"{'ict' if ict else '4h'}:{kind}_{side}" + ("_m1" if m1 else "")
     sent_ok = fire(key, f"{df.index[ev['idx']]}|{ev['level']:.2f}", "\n".join(p for p in parts if p))
     if sent_ok and SMC_SIGNAL_HOOK:
-        SMC_SIGNAL_HOOK({"kind": kind, "side": side, "entry": entry, "tp": extreme, "sl": sl, "sl_t": sl_t,
+        SMC_SIGNAL_HOOK({"system": tag, "kind": kind, "side": side, "entry": entry, "tp": extreme, "sl": sl, "sl_t": sl_t,
                          "names": list(m1["names"]) if m1 else [], "z_bot": z_bot, "z_top": z_top,
                          "event_time": df.index[ev["idx"]]})
 
@@ -2314,6 +2456,10 @@ def check_market():
         check_choch_retrace(df_4h, levels, last_1h_start)
     except Exception as e:
         print(f"CHoCH alert error: {e}")
+    try:
+        check_ict_retrace(df_4h, levels, last_1h_start)
+    except Exception as e:
+        print(f"ICT alert error: {e}")
 
     try:
         push_removals()
