@@ -78,8 +78,8 @@ ERROR_ALERT_AT = 3
 STATE_FILE = "alert_state.json"
 
 # เก็บสถานะ (รวมสมุดบันทึกผลไม้) ไว้ที่ Upstash Redis ฟรี เพื่อไม่ให้หายตอน Render รีสตาร์ท/redeploy (ไม่บังคับ)
-UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
-UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().strip("\"'“”‘’ ").rstrip("/")   # ตัดเครื่องหมายคำพูดที่เผลอติดมา
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip().strip("\"'“”‘’ ")
 STATE_KEY = os.environ.get("STATE_KEY", "xauusd_bot_state")
 REMOTE_ENABLED = bool(UPSTASH_URL and UPSTASH_TOKEN)
 
@@ -1597,8 +1597,8 @@ def maybe_send_h4_close(df_1h, df_4h):
 BREAK_ALERT = os.environ.get("BREAK_ALERT", "1") == "1"
 BREAK_AUTO_REMOVE = os.environ.get("BREAK_AUTO_REMOVE", "1") == "1"
 BREAK_WINDOW_MIN = int(os.environ.get("BREAK_WINDOW_MIN", "90"))   # ตรวจแท่งที่ปิดไม่เกินกี่นาที (กันส่งซ้ำตอนรีสตาร์ท)
-SHEET_WEBHOOK_URL = os.environ.get("SHEET_WEBHOOK_URL", "").strip()
-SHEET_WEBHOOK_SECRET = os.environ.get("SHEET_WEBHOOK_SECRET", "").strip()
+SHEET_WEBHOOK_URL = os.environ.get("SHEET_WEBHOOK_URL", "").strip().strip("\"'“”‘’ ")
+SHEET_WEBHOOK_SECRET = os.environ.get("SHEET_WEBHOOK_SECRET", "").strip().strip("\"'“”‘’ ")
 
 
 def sheet_col(tf, kind):
@@ -1761,6 +1761,300 @@ def check_breaks(tf, df, levels, last_1h_start):
                 register_removal(tf, kind, lvl - PRICE_OFFSET)
 
 # ==========================================
+# 🧭 4H CHoCH / BOS + ย่อกลับมาแตะโซน 50% (คำนวณจากโครงสร้างราคาเอง ไม่ใช้ชีต)
+# CHoCH ขาขึ้น: โครงสร้างขาลง (LH/LL) แล้วปิดแท่งเหนือ LH ล่าสุด -> ขา = LL ถึงจุดสูงสุดหลังเบรก -> ย่อแตะ 50% = BUY
+# CHoCH ขาลง : โครงสร้างขาขึ้น (HH/HL) แล้วปิดแท่งใต้ HL ล่าสุด -> ขา = HH ถึงจุดต่ำสุดหลังเบรก -> เด้งแตะ 50% = SELL
+# BOS ขาขึ้น : โครงสร้างขาขึ้น (HH/HL) แล้วปิดแท่งเหนือ HH ล่าสุด -> ขา = HL ถึงจุดสูงสุดหลังเบรก -> ย่อแตะ 50% = BUY (ไปต่อ)
+# BOS ขาลง  : โครงสร้างขาลง (LH/LL) แล้วปิดแท่งใต้ LL ล่าสุด -> ขา = LH ถึงจุดต่ำสุดหลังเบรก -> เด้งแตะ 50% = SELL (ไปต่อ)
+# ==========================================
+SMC_ALERT = os.environ.get("SMC_ALERT", "1") == "1"
+SMC_BOS = os.environ.get("SMC_BOS", "1") == "1"                      # เปิด/ปิดสัญญาณ BOS
+SMC_SWING = int(os.environ.get("SMC_SWING", "2"))                  # จุดสวิงต้องสูง/ต่ำสุดเมื่อเทียบกับกี่แท่งซ้าย-ขวา
+SMC_FIB = float(os.environ.get("SMC_FIB", "0.5"))                  # ระดับย่อ (0.5 = 50%)
+SMC_TOL_ATR = float(os.environ.get("SMC_TOL_ATR", "0.1"))          # เผื่อแตะโซน (เท่าของ ATR)
+SMC_MIN_LEG_ATR = float(os.environ.get("SMC_MIN_LEG_ATR", "1.0"))  # ขาต้องยาวอย่างน้อยกี่เท่า ATR ถึงนับ
+SMC_MAX_AGE = int(os.environ.get("SMC_MAX_AGE", "12"))             # CHoCH เก่าสุดกี่แท่ง 4H (12 = 2 วัน)
+SMC_SL_ATR = float(os.environ.get("SMC_SL_ATR", "0.2"))            # SL เผื่อเลยจุดเริ่มขาไปกี่เท่า ATR
+SMC_FIB_DEEP = float(os.environ.get("SMC_FIB_DEEP", "0.618"))      # ขอบลึกของโซน (โซน = SMC_FIB ถึง SMC_FIB_DEEP = 50%-61.8%)
+SMC_M1_CONFIRM = True   # บังคับ: แจ้งเฉพาะตอนราคาชนโซน + มีแท่ง M1 กลับตัวเท่านั้น
+SMC_M1_WICK_RATIO = float(os.environ.get("SMC_M1_WICK_RATIO", "2"))   # ไส้ M1 ต้องยาว >= กี่เท่าของตัวแท่ง
+SMC_M1_WICK_PCT = float(os.environ.get("SMC_M1_WICK_PCT", "0.4"))     # ไส้ M1 ต้องยาว >= กี่ส่วนของช่วงแท่ง
+SMC_M1_MAX_AGE_MIN = int(os.environ.get("SMC_M1_MAX_AGE_MIN", "5"))   # แท่งยืนยันต้องปิดไม่เกินกี่นาทีที่แล้ว
+SMC_M1_NEAR_ATR = float(os.environ.get("SMC_M1_NEAR_ATR", "0.5"))     # ดึงข้อมูล M1 เมื่อราคาห่างโซนไม่เกินกี่เท่า ATR 4H
+SMC_M1_SL_BUF = float(os.environ.get("SMC_M1_SL_BUF", "0.5"))         # SL แคบ: เผื่อเลยไส้ M1 กี่จุด
+SMC_M1_PATTERNS = {"wick", "engulf", "pin", "star"}   # ล็อกเฉพาะ ไส้ปฏิเสธราคา / กลืนกิน / Pinbar / Star
+SMC_M1_MIN_BODY = float(os.environ.get("SMC_M1_MIN_BODY", "0.3"))        # ตัวแท่งที่นับเป็นแท่งจริง (จุดราคา)
+SMC_M1_ENGULF_TOL = float(os.environ.get("SMC_M1_ENGULF_TOL", "0.1"))    # เผื่อราคาเปิดไม่เป๊ะ (จุดราคา)
+SMC_M1_TWEEZER_TOL = float(os.environ.get("SMC_M1_TWEEZER_TOL", "0.3"))  # Tweezer: High/Low สองแท่งต่างกันได้ไม่เกินกี่จุด
+SMC_M1_PIN_PCT = float(os.environ.get("SMC_M1_PIN_PCT", "0.6"))          # Pinbar: ไส้หลักยาว >= กี่ส่วนของแท่ง
+SMC_M1_TF_MIN = 1          # ความยาวแท่งยืนยัน (นาที) ปกติ 1 / ใช้ 5 ตอน backtest ด้วยข้อมูล M5
+SMC_SIGNAL_HOOK = None     # ใช้ตอน backtest เท่านั้น (บอทจริงปล่อยเป็น None)
+_m1_cache = {"ts": 0.0, "df": None}
+
+
+def find_structure(df, n):
+    """สแกนแท่งที่ปิดแล้ว คืน {"choch": เหตุการณ์ล่าสุด, "bos": เหตุการณ์ล่าสุด}
+    เหตุการณ์ = {kind, side, idx, level, start} จุดสวิงยืนยันหลังผ่านไป n แท่ง และนับเฉพาะ H/L สลับกัน"""
+    hi, lo, cl = df["High"].values, df["Low"].values, df["Close"].values
+    piv, events = [], {}
+    for j in range(2 * n, len(df)):
+        i = j - n
+        is_h = hi[i] > hi[i - n:i].max() and hi[i] >= hi[i + 1:j + 1].max()
+        is_l = lo[i] < lo[i - n:i].min() and lo[i] <= lo[i + 1:j + 1].min()
+        if is_h != is_l:
+            kind, price = ("H", float(hi[i])) if is_h else ("L", float(lo[i]))
+            if piv and piv[-1][1] == kind:
+                if (kind == "H" and price > piv[-1][2]) or (kind == "L" and price < piv[-1][2]):
+                    piv[-1] = (i, kind, price)   # H/L ติดกัน เก็บตัวที่สุดขอบกว่า
+            else:
+                piv.append((i, kind, price))
+
+        highs = [p for p in piv if p[1] == "H"]
+        lows = [p for p in piv if p[1] == "L"]
+        if len(highs) < 2 or len(lows) < 2:
+            continue
+        h1, h2 = highs[-2], highs[-1]
+        l1, l2 = lows[-2], lows[-1]
+        if h2[2] > h1[2] and l2[2] > l1[2]:
+            trend = "up"      # HH + HL
+        elif h2[2] < h1[2] and l2[2] < l1[2]:
+            trend = "down"    # LH + LL
+        else:
+            continue
+
+        if trend == "down" and cl[j] > h2[2]:
+            kind, side, level = "choch", "buy", h2[2]
+            start = float(lo[l2[0]:j + 1].min())     # LL
+        elif trend == "up" and cl[j] < l2[2]:
+            kind, side, level = "choch", "sell", l2[2]
+            start = float(hi[h2[0]:j + 1].max())     # HH
+        elif trend == "up" and cl[j] > h2[2]:
+            kind, side, level = "bos", "buy", h2[2]
+            start = float(lo[l2[0]:j + 1].min())     # HL
+        elif trend == "down" and cl[j] < l2[2]:
+            kind, side, level = "bos", "sell", l2[2]
+            start = float(hi[h2[0]:j + 1].max())     # LH
+        else:
+            continue
+        prev = events.get(kind)
+        if prev and prev["side"] == side and abs(prev["level"] - level) < 0.005:
+            continue   # เหตุการณ์ตัวเดิม
+        events[kind] = {"kind": kind, "side": side, "idx": j, "level": float(level), "start": start}
+    return events
+
+
+def check_choch_retrace(df, levels, last_1h_start):
+    if not SMC_ALERT or len(df) < 40:
+        return
+    cl_i = closed_bar_index("4h", df, last_1h_start)
+    if cl_i is None:
+        return
+    closed = df if cl_i == -1 else df.iloc[:-1]
+    events = find_structure(closed, SMC_SWING)
+    atr_val = float(calculate_atr(closed).iloc[-1])
+    if pd.isna(atr_val):
+        return
+    risk = risk_notes(levels.get("news", []))
+    for kind, ev in events.items():
+        if kind == "bos" and not SMC_BOS:
+            continue
+        _structure_alert(df, closed, ev, atr_val, risk)
+
+
+def fetch_1m():
+    c = _m1_cache
+    if c["df"] is not None and time.time() - c["ts"] < 20:
+        return c["df"]
+    df = yf.download(SYMBOL, period="2d", interval="1m", progress=False, auto_adjust=False, timeout=20)
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df[["Open", "High", "Low", "Close"]].dropna()
+    df.index = to_server_index(df.index)
+    df = df[~df.index.duplicated(keep="last")]
+    c.update(ts=time.time(), df=df)
+    return df
+
+
+def _mir(bar):
+    """กลับด้านราคา (O,H,L,C) เพื่อให้ฝั่ง BUY ใช้ตรรกะฝั่ง SELL ชุดเดียวกัน"""
+    o, h, l, c = bar
+    return (-o, -l, -h, -c)
+
+
+def _m1_sell_patterns(z, a, b):
+    """แพทเทิร์นกลับตัวขาลงบนแท่ง M1 ที่ปิดแล้ว (z, a, b = 3 แท่งล่าสุดเรียงเวลา, b ล่าสุด, z อาจเป็น None)
+    คืน [(รหัส, High สุดขอบของแพทเทิร์น)]"""
+    out = []
+    bo, bh, bl, bc = b
+    rng = bh - bl
+    if rng <= 0 or a is None:
+        return out
+    ao, ah, al, ac = a
+    body = max(abs(bc - bo), 0.01)
+    up = bh - max(bo, bc)
+    low_w = min(bo, bc) - bl
+    a_green, b_red = ac > ao, bc < bo
+    a_body, b_body = ac - ao, bo - bc
+    both = a_green and b_red and a_body >= SMC_M1_MIN_BODY and b_body >= SMC_M1_MIN_BODY
+    top = max(ah, bh)
+    P = SMC_M1_PATTERNS
+
+    # ไส้ปฏิเสธราคา: เขียว->แดง ไส้บนยาว ทะลุเหนือ High แท่งเขียว
+    if "wick" in P and a_green and b_red and bh > ah and up >= SMC_M1_WICK_RATIO * body and up >= SMC_M1_WICK_PCT * rng:
+        out.append(("wick", bh))
+    # กลืนกิน: ตัวแดงคลุมตัวเขียว
+    if "engulf" in P and both and bc <= ao and bo >= ac - SMC_M1_ENGULF_TOL:
+        out.append(("engulf", top))
+    # Pinbar / Shooting Star: ไส้บนยาว ตัวเล็ก ปิดในช่วงล่างของแท่ง
+    if "pin" in P and up >= SMC_M1_WICK_RATIO * body and up >= SMC_M1_PIN_PCT * rng \
+            and low_w <= 0.25 * rng and (bc - bl) <= 0.4 * rng:
+        out.append(("pin", bh))
+    # Evening Star: เขียวแรง -> แท่งตัวเล็กอยู่ครึ่งบน -> แดงปิดต่ำกว่ากลางแท่งเขียว
+    if "star" in P and z is not None:
+        zo, zh, zl, zc = z
+        zmid = (zo + zc) / 2
+        if (zc - zo) >= SMC_M1_MIN_BODY and abs(ac - ao) <= 0.3 * (zc - zo) and min(ao, ac) >= zmid \
+                and b_body >= SMC_M1_MIN_BODY and bc < zmid:
+            out.append(("star", max(zh, ah, bh)))
+    # Tweezer Top: High ของสองแท่งเท่ากัน เขียว->แดง
+    if "tweezer" in P and both and abs(ah - bh) <= SMC_M1_TWEEZER_TOL:
+        out.append(("tweezer", top))
+    # Dark Cloud Cover: แดงเปิดที่/เหนือราคาปิดเขียว ปิดลึกกว่าครึ่งตัวเขียวแต่ไม่ถึงราคาเปิด
+    if "cloud" in P and both and bo >= ac - SMC_M1_ENGULF_TOL and ao < bc < (ao + ac) / 2:
+        out.append(("cloud", top))
+    return out
+
+
+_M1_NAMES = {
+    "sell": {"wick": "ไส้บนปฏิเสธราคา", "engulf": "Bearish Engulfing (กลืนกิน)", "pin": "Shooting Star (Pinbar)",
+             "star": "Evening Star", "tweezer": "Tweezer Top", "cloud": "Dark Cloud Cover"},
+    "buy": {"wick": "ไส้ล่างปฏิเสธราคา", "engulf": "Bullish Engulfing (กลืนกิน)", "pin": "Hammer (Pinbar)",
+            "star": "Morning Star", "tweezer": "Tweezer Bottom", "cloud": "Piercing Line"},
+}
+
+
+def find_m1_confirm(side, m1, z_lo, z_hi, tol):
+    """หาแท่งยืนยัน M1 (เฉพาะแท่งที่ปิดแล้ว 3 แท่งล่าสุดเป็นแท่งสุดท้ายของแพทเทิร์น)
+    แพทเทิร์นต้องชนโซน [z_lo, z_hi] และแท่งสุดท้ายปิดไม่เลยโซนไปไกล คืน dict หรือ None"""
+    now = now_server()
+    closed = m1[m1.index + pd.Timedelta(minutes=SMC_M1_TF_MIN) <= now]
+    n = len(closed)
+    if n < 2:
+        return None
+    sell = side == "sell"
+    zl, zh = (z_lo, z_hi) if sell else (-z_hi, -z_lo)   # BUY ใช้ราคากลับด้าน
+    conv = (lambda x: x) if sell else _mir
+    for k in range(n - 1, max(n - 4, 0), -1):
+        t_close = closed.index[k] + pd.Timedelta(minutes=SMC_M1_TF_MIN)
+        if now - t_close > pd.Timedelta(minutes=SMC_M1_MAX_AGE_MIN):
+            break
+        b, a = conv(ohlc(closed, k)), conv(ohlc(closed, k - 1))
+        z = conv(ohlc(closed, k - 2)) if k >= 2 else None
+        hits = [(nm, ext) for nm, ext in _m1_sell_patterns(z, a, b) if ext >= zl - tol and b[3] <= zh + tol]
+        if hits:
+            ext = max(e for _, e in hits)
+            return {"time": closed.index[k], "b": ohlc(closed, k), "ext": ext if sell else -ext,
+                    "names": [_M1_NAMES[side][nm] for nm, _ in hits]}
+    return None
+
+
+def _structure_alert(df, closed, ev, atr_val, risk):
+    age = len(closed) - 1 - ev["idx"]
+    if age > SMC_MAX_AGE:
+        return
+    kind, buy, start = ev["kind"], ev["side"] == "buy", ev["start"]
+    name = "CHoCH" if kind == "choch" else "BOS"
+    after = df.iloc[ev["idx"]:]          # ตั้งแต่แท่งเบรกจนถึงแท่งสด
+    cur = float(df["Close"].iloc[-1])
+    tol = SMC_TOL_ATR * atr_val
+    near = max(tol, SMC_M1_NEAR_ATR * atr_val)
+    if buy:
+        extreme = float(after["High"].max())
+        leg = extreme - start
+        z_top, z_bot = extreme - leg * SMC_FIB, extreme - leg * SMC_FIB_DEEP
+        broken = float(after["Close"].min()) < start
+        near_ok = start < cur <= z_top + near
+    else:
+        extreme = float(after["Low"].min())
+        leg = start - extreme
+        z_bot, z_top = extreme + leg * SMC_FIB, extreme + leg * SMC_FIB_DEEP
+        broken = float(after["Close"].max()) > start
+        near_ok = z_bot - near <= cur < start
+
+    ev_label = fmt(df.index[ev["idx"]])
+    print(f"[4H] {name} {'BUY' if buy else 'SELL'} แท่ง {ev_label} | ขา {px(start):.2f}→{px(extreme):.2f} "
+          f"| โซน {px(z_bot):.2f}–{px(z_top):.2f} | ราคา {px(cur):.2f} | อายุ {age} แท่ง | ขาพัง={broken} | ใกล้โซน={near_ok}")
+    if broken or leg < SMC_MIN_LEG_ATR * atr_val or not near_ok:
+        return
+    if SKIP_RISK_WINDOWS and risk:
+        return
+
+    side = ev["side"]
+    m1 = None
+    if SMC_M1_CONFIRM:
+        m1df = fetch_1m()
+        if m1df is None:
+            print(f"[4H] {name}: ดึงข้อมูล M1 ไม่ได้ ลองใหม่รอบหน้า")
+            return
+        m1 = find_m1_confirm(side, m1df, z_bot, z_top, tol)
+        if m1 is None:
+            print(f"[4H] {name} {side}: ราคาใกล้โซน รอแท่ง M1 กลับตัวที่ปิดแล้ว (ยังไม่แจ้ง)")
+            return
+        entry = m1["b"][3]
+    else:
+        if not (z_bot - tol <= cur <= z_top + tol):
+            return
+        entry = cur
+
+    if kind == "choch":
+        s_lbl, e_lbl, brk = ("LL", "จุดสูงสุด", "เหนือ LH") if buy else ("HH", "จุดต่ำสุด", "ใต้ HL")
+        icon, what = "🧭", f"CHoCH {'ขาขึ้น' if buy else 'ขาลง'}"
+    else:
+        s_lbl, e_lbl, brk = ("HL", "จุดสูงสุด", "เหนือ HH") if buy else ("LH", "จุดต่ำสุด", "ใต้ LL")
+        icon, what = "📐", f"BOS {'ขาขึ้น' if buy else 'ขาลง'}"
+    act = "BUY" if buy else "SELL"
+    title = f"{icon} <b>4H {what} + {'M1 ยืนยัน' if m1 else 'เข้าโซน'} 50–61.8% → {act}</b>"
+
+    if buy:
+        sl = start - SMC_SL_ATR * atr_val
+        rr = (extreme - entry) / (entry - sl) if entry > sl else 0
+    else:
+        sl = start + SMC_SL_ATR * atr_val
+        rr = (entry - extreme) / (sl - entry) if sl > entry else 0
+    lines = [
+        f"🔓 ปิด{brk} <code>{px(ev['level']):.2f}</code> (แท่ง {ev_label})",
+        f"📏 ขา: {s_lbl} <code>{px(start):.2f}</code> → {e_lbl} <code>{px(extreme):.2f}</code> ({leg:.2f} จุด)",
+        f"🎯 โซน {SMC_FIB:.1%}–{SMC_FIB_DEEP:.1%}: <code>{px(z_bot):.2f}</code> – <code>{px(z_top):.2f}</code>",
+    ]
+    sl_t = None
+    if m1:
+        sl_t = m1["ext"] - SMC_M1_SL_BUF if buy else m1["ext"] + SMC_M1_SL_BUF
+        if buy:
+            rr_t = (extreme - entry) / (entry - sl_t) if entry > sl_t else 0
+        else:
+            rr_t = (entry - extreme) / (sl_t - entry) if sl_t > entry else 0
+        lines.append(f"🕯 M1 {fmt(m1['time'])} ({len(m1['names'])} รูปแบบ): " + " + ".join(m1["names"]))
+        lines.append(f"💵 เข้า (ราคาปิด M1): <code>{px(entry):.2f}</code> | จุดสุดขอบแพทเทิร์น <code>{px(m1['ext']):.2f}</code>")
+        lines.append(f"🛑 SL แคบ (เลยแพทเทิร์น {SMC_M1_SL_BUF:g} จุด): <code>{px(sl_t):.2f}</code> | R:R 1:{rr_t:.1f}")
+        lines.append(f"🛡 SL โครงสร้าง (เลยจุดเริ่มขา +{SMC_SL_ATR:g}×ATR {atr_val:.2f}): <code>{px(sl):.2f}</code> | R:R 1:{rr:.1f}")
+    else:
+        lines.append(f"💵 ราคาตอนนี้: <code>{px(cur):.2f}</code>")
+        lines.append(f"🛑 SL (เลยจุดเริ่มขา +{SMC_SL_ATR:g}×ATR {atr_val:.2f}): <code>{px(sl):.2f}</code> | R:R 1:{rr:.1f}")
+    lines.append(f"🏁 เป้า ({e_lbl}ของขา): <code>{px(extreme):.2f}</code>")
+    parts = [title, f"📊 XAUUSD ({SYMBOL}) | TF 4H"] + lines + risk
+    if PRICE_OFFSET:
+        parts.append(f"ℹ️ ราคาแสดงเป็นระดับ MT5 (GC=F − {PRICE_OFFSET:g})")
+    parts.append("📱 <b>เปิด MT5 เช็กกราฟก่อนตัดสินใจ</b>")
+    key = f"4h:{kind}_{side}" + ("_m1" if m1 else "")
+    sent_ok = fire(key, f"{df.index[ev['idx']]}|{ev['level']:.2f}", "\n".join(p for p in parts if p))
+    if sent_ok and SMC_SIGNAL_HOOK:
+        SMC_SIGNAL_HOOK({"kind": kind, "side": side, "entry": entry, "tp": extreme, "sl": sl, "sl_t": sl_t,
+                         "names": list(m1["names"]) if m1 else [], "z_bot": z_bot, "z_top": z_top,
+                         "event_time": df.index[ev["idx"]]})
+
+# ==========================================
 # 🔍 วนตรวจตลาด
 # ==========================================
 def send_heartbeat(df_1h):
@@ -1859,6 +2153,12 @@ def check_market():
             check_breaks(tf, df, levels, last_1h_start)
         except Exception as e:
             print(f"Break alert error TF {tf}: {e}")
+
+    # 🧭 4H CHoCH / BOS + ย่อแตะโซน 50–61.8% (+ M1 ยืนยัน)
+    try:
+        check_choch_retrace(df_4h, levels, last_1h_start)
+    except Exception as e:
+        print(f"CHoCH alert error: {e}")
 
     try:
         push_removals()
