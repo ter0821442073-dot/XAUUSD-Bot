@@ -988,6 +988,7 @@ def build_weekly_msg(start_s, end_s, week_res, all_res, skipped=0, prev_res=None
         lines.append(f"⚠️ มี {skipped} แถวในชีตไม่ถูกนับ (ข้อมูลไม่ถูกต้อง)")
     if unknown_n:
         lines.append(f"❓ ตรวจผลไม่ได้ {unknown_n} ไม้ (เก่าเกินข้อมูล ใส่ Exit ในชีตได้)")
+    lines += journal_lines(start_s, end_s)
     return "\n".join(lines)
 
 
@@ -1387,6 +1388,7 @@ def build_monthly_msg(start_th, end_th, start_s, end_s, month_res, all_res, skip
         lines.append(f"❓ ตรวจผลไม่ได้ {unknown_n} ไม้ (เก่าเกินข้อมูลและไม่มีในสมุดบันทึก ใส่ Exit ในชีตได้)")
     if skipped:
         lines.append(f"⚠️ มี {skipped} แถวในชีตไม่ถูกนับ (ข้อมูลไม่ถูกต้อง)")
+    lines += journal_lines(start_s, end_s)
     return "\n".join(lines)
 
 
@@ -1512,6 +1514,8 @@ def build_yearly_msg(label, start_th, end_th, year_res, all_res, skipped=0):
         lines.append(f"⏳ ไม้ที่ยังเปิดอยู่: {open_n}")
     if skipped:
         lines.append(f"⚠️ มี {skipped} แถวในชีตไม่ถูกนับ (ข้อมูลไม่ถูกต้อง)")
+    lines += journal_lines(utc_to_server(start_th - pd.Timedelta(hours=7)),
+                           utc_to_server(end_th - pd.Timedelta(hours=7)))
     return "\n".join(lines)
 
 
@@ -1523,6 +1527,9 @@ def purge_after_yearly(end_s):
     for k in old:
         led.pop(k, None)
         sent.pop(f"trade:{k}", None)
+    jr = sent.get("journal", {})
+    for k in [k for k, v in jr.items() if pd.Timestamp(v["t"]) <= end_s]:
+        jr.pop(k, None)   # เคลียร์สมุดบันทึกสัญญาณของปีที่สรุปแล้ว
     cutoff = now_server() - pd.Timedelta(days=7)
     for k in [k for k in sent if ":cd_" in k]:
         try:
@@ -2342,10 +2349,125 @@ def _structure_alert(df, closed, ev, atr_val, risk, mode="smc"):
     parts.append("📱 <b>เปิด MT5 เช็กกราฟก่อนตัดสินใจ</b>")
     key = f"{'ict' if ict else '4h'}:{kind}_{side}" + ("_m1" if m1 else "")
     sent_ok = fire(key, f"{df.index[ev['idx']]}|{ev['level']:.2f}", "\n".join(p for p in parts if p))
+    if sent_ok:
+        try:
+            record_signal(tag.lower(), kind, side, entry, extreme, sl, sl_t,
+                          sum(1 for v in fl.values() if v) if ict else None)
+        except Exception as e:
+            print(f"Journal record error: {e}")
     if sent_ok and SMC_SIGNAL_HOOK:
         SMC_SIGNAL_HOOK({"system": tag, "kind": kind, "side": side, "entry": entry, "tp": extreme, "sl": sl, "sl_t": sl_t,
                          "names": list(m1["names"]) if m1 else [], "z_bot": z_bot, "z_top": z_top,
                          "event_time": df.index[ev["idx"]]})
+
+# ==========================================
+# 🧪 สมุดบันทึกสัญญาณ (Signal Journal): จดสัญญาณ SMC/ICT ที่บอทส่ง แล้วตามดูเองว่าชนเป้าหรือ SL ก่อน
+# วัดผล 2 แบบต่อสัญญาณ: SL แคบ (เลยแพทเทิร์น M1) และ SL โครงสร้าง / ถ้า SL กับเป้าอยู่แท่ง 5 นาทีเดียวกัน นับเป็น SL
+# ใช้ราคา GC=F ตรงๆ (เหมือนส่วนอื่น) แสดงผลเป็นสถิติท้ายสรุปรายสัปดาห์/เดือน/ปี
+# ==========================================
+JOURNAL_ENABLED = os.environ.get("JOURNAL_ENABLED", "1") == "1"
+JOURNAL_MAX_DAYS = int(os.environ.get("JOURNAL_MAX_DAYS", "3"))   # สัญญาณที่ยังไม่ชนทั้งเป้า/SL ภายในกี่วัน ถือว่าหมดอายุ (ไม่นับ)
+
+
+def record_signal(system, kind, side, entry, tp, sl, sl_t, score):
+    if not JOURNAL_ENABLED:
+        return
+    j = sent.setdefault("journal", {})
+    t = now_server().floor("min")
+    jid = f"{system}|{kind}|{side}|{t:%Y%m%d%H%M}"
+    j[jid] = {"sy": system, "k": kind, "d": side, "t": str(t),
+              "e": round(entry, 2), "tp": round(tp, 2), "s": round(sl, 2),
+              "st": round(sl_t, 2) if sl_t is not None else None,
+              "sc": score, "rs": None, "rt": None}
+    cutoff = now_server() - pd.Timedelta(days=LEDGER_KEEP_DAYS)
+    for k in [k for k, v in j.items() if pd.Timestamp(v["t"]) < cutoff]:
+        j.pop(k, None)
+    save_state()
+
+
+def _journal_pending(r):
+    return r["rs"] is None or (r["st"] is not None and r["rt"] is None)
+
+
+def monitor_journal():
+    """ตามผลสัญญาณที่ยังไม่จบ (ใช้ข้อมูล 5 นาที ดึงเฉพาะเมื่อมีสัญญาณค้าง)"""
+    if not JOURNAL_ENABLED:
+        return
+    j = sent.get("journal")
+    pend = [(k, r) for k, r in (j or {}).items() if _journal_pending(r)]
+    if not pend:
+        return
+    now = now_server()
+    days = min((now - min(pd.Timestamp(r["t"]) for _, r in pend)).days + 2, 59)
+    bars = fetch_5m(days)
+    if bars is None:
+        return
+    changed = False
+    for _, r in pend:
+        t = pd.Timestamp(r["t"])
+        sub = bars[bars.index >= t.floor("5min") + pd.Timedelta(minutes=5)]
+        buy = r["d"] == "buy"
+        for key, slv in (("rs", r["s"]), ("rt", r["st"])):
+            if r[key] is not None or slv is None:
+                continue
+            if sub.empty:
+                continue
+            hit_sl = (sub["Low"] <= slv) if buy else (sub["High"] >= slv)
+            hit_tp = (sub["High"] >= r["tp"]) if buy else (sub["Low"] <= r["tp"])
+            anyh = hit_sl | hit_tp
+            if anyh.any():
+                first = anyh.idxmax()
+                r[key] = "sl" if bool(hit_sl.loc[first]) else "tp"
+                changed = True
+            elif now - t > pd.Timedelta(days=JOURNAL_MAX_DAYS):
+                r[key] = "exp"
+                changed = True
+    if changed:
+        save_state()
+
+
+def _jr(r, key, res):
+    """ผลเป็นหน่วย R: SL = -1R / ถึงเป้า = ระยะเป้า ÷ ระยะ SL"""
+    if res == "sl":
+        return -1.0
+    slv = r["s"] if key == "rs" else r["st"]
+    risk = abs(r["e"] - slv)
+    return abs(r["tp"] - r["e"]) / risk if risk > 0 else 0.0
+
+
+def _jline(label, items):
+    """items = [(record, key)] นับเฉพาะที่จบแล้ว (tp/sl)"""
+    done = [(r, r[k], k) for r, k in items if r[k] in ("tp", "sl")]
+    if not done:
+        return f"  • {label}: ยังไม่มีผลที่จบ"
+    w = sum(1 for _, res, _ in done if res == "tp")
+    sr = sum(_jr(r, k, res) for r, res, k in done)
+    return f"  • {label}: ชนะ {w}/{len(done)} ({w / len(done) * 100:.0f}%) | รวม {sr:+.2f}R"
+
+
+def journal_lines(start_s, end_s):
+    """บรรทัดสถิติสัญญาณบอทของช่วง (start_s, end_s] เวลา MT5 (นับตามเวลาที่บอทส่งสัญญาณ)"""
+    recs = [r for r in sent.get("journal", {}).values() if start_s < pd.Timestamp(r["t"]) <= end_s]
+    if not recs:
+        return []
+    out = ["", "🧪 <b>สถิติสัญญาณบอท</b> (วัดตามแผน SL/เป้าที่แจ้ง)"]
+    for sy, name in (("smc", "SMC"), ("ict", "ICT")):
+        rs = [r for r in recs if r["sy"] == sy]
+        if not rs:
+            continue
+        pend = sum(1 for r in rs if _journal_pending(r))
+        out.append(f"{name}: {len(rs)} สัญญาณ" + (f" (รอผล {pend})" if pend else ""))
+        out.append(_jline("SL แคบ", [(r, "rt") for r in rs if r["st"] is not None]))
+        out.append(_jline("SL โครงสร้าง", [(r, "rs") for r in rs]))
+        if sy == "ict":
+            hi = [(r, "rt") for r in rs if r["st"] is not None and (r["sc"] or 0) >= 4]
+            lo = [(r, "rt") for r in rs if r["st"] is not None and (r["sc"] or 0) < 4]
+            if hi:
+                out.append(_jline("คะแนน ICT ≥4 (SL แคบ)", hi))
+            if lo:
+                out.append(_jline("คะแนน ICT &lt;4 (SL แคบ)", lo))
+    return out
+
 
 # ==========================================
 # 🔍 วนตรวจตลาด
@@ -2435,6 +2557,10 @@ def check_market():
         monitor_trades(levels)
     except Exception as e:
         print(f"Trade monitor error: {e}")
+    try:
+        monitor_journal()
+    except Exception as e:
+        print(f"Journal monitor error: {e}")
 
     df_4h = to_4h(df_1h)
     k4 = calculate_stoch(df_4h)
