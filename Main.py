@@ -1749,12 +1749,14 @@ def maybe_send_h4_close(df_1h, df_4h):
 # ==========================================
 # 💥 ปิดแท่งเบรกแนวต้าน/แนวรับ (H1, H4) + ลบแนวที่เบรกออกจากชีตอัตโนมัติ
 # เบรกขึ้น: ปิดแท่งเหนือแนวต้าน (แท่งก่อนหน้าปิดใต้แนว) / เบรกลง: ปิดแท่งใต้แนวรับ (แท่งก่อนหน้าปิดเหนือแนว)
+# ไส้ทะลุแนวแต่ปิดกลับ = ยังไม่นับเบรก ไม่แจ้ง ไม่ลบแนว
 # แนวที่เบรกแล้วเลิกใช้ทันที (ไม่ใช้เป็นแนวรับ/ต้านเก่า) และสั่งลบออกจากชีตผ่าน Google Apps Script (SHEET_WEBHOOK_URL)
 # ลบเฉพาะคอลัมน์ของ TF นั้น (เช่น เบรกต้าน H1 ลบจาก 1H_Res)
 # ==========================================
 BREAK_ALERT = os.environ.get("BREAK_ALERT", "1") == "1"
 BREAK_AUTO_REMOVE = os.environ.get("BREAK_AUTO_REMOVE", "1") == "1"
 BREAK_WINDOW_MIN = int(os.environ.get("BREAK_WINDOW_MIN", "90"))   # ตรวจแท่งที่ปิดไม่เกินกี่นาที (กันส่งซ้ำตอนรีสตาร์ท)
+BREAK_CLOSE_BUFFER = float(os.environ.get("BREAK_CLOSE_BUFFER", "0"))   # ราคาปิดต้องเลยแนวอย่างน้อยกี่จุด (0 = เลยแนวนิดเดียวก็นับ)
 SHEET_WEBHOOK_URL = os.environ.get("SHEET_WEBHOOK_URL", "").strip().strip("\"'“”‘’ ")
 SHEET_WEBHOOK_SECRET = os.environ.get("SHEET_WEBHOOK_SECRET", "").strip().strip("\"'“”‘’ ")
 
@@ -1855,8 +1857,21 @@ def check_breaks(tf, df, levels, last_1h_start):
     po, ph, pl, pc = ohlc(df, cl_i - 1)
     res_list = [v + PRICE_OFFSET for v in levels[tf]["res"]]
     sup_list = [v + PRICE_OFFSET for v in levels[tf]["sup"]]
-    up = [r for r in res_list if pc <= r < c]      # แนวต้านที่ปิดทะลุขึ้น
-    down = [s for s in sup_list if c < s <= pc]    # แนวรับที่ปิดทะลุลง
+
+    buf = BREAK_CLOSE_BUFFER
+    # เบรกขึ้น: แท่งก่อนหน้ายังปิดไม่เหนือแนว และแท่งนี้ "ปิด" เหนือแนว (+buffer)
+    up = [r for r in res_list if pc <= r + buf < c]
+    # เบรกลง: แท่งก่อนหน้ายังปิดไม่ใต้แนว และแท่งนี้ "ปิด" ใต้แนว (-buffer)
+    down = [s for s in sup_list if c < s - buf <= pc]
+
+    # ไส้ทะลุแนวแต่ปิดกลับ = เบรกหลอก ไม่แจ้งเบรก ไม่ลบแนว (แค่ลงล็อก)
+    for r in res_list:
+        if h > r and r not in up and c <= r + buf and pc <= r + buf:
+            print(f"[{tf.upper()}] ไส้ทะลุแนวต้าน {px(r):.2f} (High {px(h):.2f}) แต่ปิด {px(c):.2f} ไม่เหนือแนว → ยังไม่นับเบรก เก็บแนวไว้")
+    for s in sup_list:
+        if l < s and s not in down and c >= s - buf and pc >= s - buf:
+            print(f"[{tf.upper()}] ไส้ทะลุแนวรับ {px(s):.2f} (Low {px(l):.2f}) แต่ปิด {px(c):.2f} ไม่ใต้แนว → ยังไม่นับเบรก เก็บแนวไว้")
+
     n_res = min((r for r in res_list if r > c), default=None)   # ต้านใกล้สุดเหนือราคาปิด
     n_sup = max((s for s in sup_list if s < c), default=None)   # รับใกล้สุดใต้ราคาปิด
     print(f"[{tf.upper()}] เช็กเบรก แท่งปิด {fmt(bar_start)} | C ก่อนหน้า {px(pc):.2f} → C {px(c):.2f} | "
