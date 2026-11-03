@@ -1964,6 +1964,20 @@ SMC_M1_TF_MIN = 1          # ความยาวแท่งยืนยัน
 SMC_SIGNAL_HOOK = None     # ใช้ตอน backtest เท่านั้น (บอทจริงปล่อยเป็น None)
 _m1_cache = {"ts": 0.0, "df": None}
 
+# ---------- 🆕 SMC บน M15: เกิดรูปแบบ CHoCH/BOS ใน M15 แล้วราคาย้อนกลับมาชนโซน 50–61.8% = แจ้งเตือนทันที (ไม่รอ M1) ----------
+M15_ALERT = os.environ.get("M15_ALERT", "1") == "1"                    # 0 = ปิดระบบ SMC M15
+M15_BOS = os.environ.get("M15_BOS", "1") == "1"                        # รวมสัญญาณ BOS
+M15_SWING = int(os.environ.get("M15_SWING", "2"))                      # จุดสวิงของ M15
+M15_FIB = float(os.environ.get("M15_FIB", "0.5"))                      # ขอบตื้นของโซน (50%)
+M15_FIB_DEEP = float(os.environ.get("M15_FIB_DEEP", "0.618"))          # ขอบลึกของโซน (61.8%)
+M15_TOL_ATR = float(os.environ.get("M15_TOL_ATR", "0.1"))              # เผื่อแตะโซน (เท่าของ ATR M15)
+M15_MIN_LEG_ATR = float(os.environ.get("M15_MIN_LEG_ATR", "1.0"))      # ขาต้องยาวอย่างน้อยกี่เท่า ATR M15
+M15_MAX_AGE = int(os.environ.get("M15_MAX_AGE", "32"))                 # CHoCH/BOS เก่าสุดกี่แท่ง M15 (32 = 8 ชม.)
+M15_SL_ATR = float(os.environ.get("M15_SL_ATR", "0.2"))                # SL เผื่อเลยจุดเริ่มขากี่เท่า ATR M15
+M15_TOUCH_BARS = int(os.environ.get("M15_TOUCH_BARS", "2"))            # นับการชนโซนจากกี่แท่งล่าสุด (รวมแท่งสด) กันแจ้งของเก่า
+M15_LIVE_GRACE_SEC = int(os.environ.get("M15_LIVE_GRACE_SEC", "120"))  # Yahoo ส่งแท่ง M15 ใหม่ช้า ถือว่าแท่งล่าสุดยังวิ่งอยู่ได้กี่วินาที
+_m15_cache = {"ts": 0.0, "df": None}
+
 
 def find_structure(df, n):
     """สแกนแท่งที่ปิดแล้ว คืน {"choch": เหตุการณ์ล่าสุด, "bos": เหตุการณ์ล่าสุด}
@@ -2067,6 +2081,130 @@ def fetch_1m():
     df = df[~df.index.duplicated(keep="last")]
     c.update(ts=time.time(), df=df)
     return df
+
+
+# ---------- 🆕 SMC M15: ดึงข้อมูล M15 + ตรวจการย้อนชนโซน 50–61.8% แล้วแจ้งทันที ----------
+def fetch_15m():
+    c = _m15_cache
+    if c["df"] is not None and time.time() - c["ts"] < 45:
+        return c["df"]
+    df = yf.download(SYMBOL, period="10d", interval="15m", progress=False, auto_adjust=False, timeout=20)
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df[["Open", "High", "Low", "Close"]].dropna()
+    df.index = to_server_index(df.index)
+    df = df[~df.index.duplicated(keep="last")]
+    c.update(ts=time.time(), df=df)
+    return df
+
+
+def check_m15_retrace(levels):
+    """SMC บน M15: เกิด CHoCH/BOS (ปิดแท่งเบรก) -> ขา = จุดเริ่มขาถึงจุดสุดขอบหลังเบรก
+    -> ราคาย้อนกลับมาชนโซน 50–61.8% ของขา = แจ้งเตือนทันที (ไม่ต้องรอแท่ง M1 ยืนยัน และไม่ต้องรอปิดแท่ง M15)"""
+    if not M15_ALERT:
+        return
+    df = fetch_15m()
+    if df is None or len(df) < 40:
+        print("[M15 SMC] ดึงข้อมูล M15 ไม่ได้/ไม่พอ ข้ามรอบนี้")
+        return
+
+    delta = pd.Timedelta(minutes=15)
+    now = now_server()
+    is_live = df.index[-1] + delta + pd.Timedelta(seconds=M15_LIVE_GRACE_SEC) > now
+    closed = df.iloc[:-1] if is_live else df
+    if len(closed) < 40:
+        return
+
+    events = find_structure(closed, M15_SWING)
+    atr_val = float(calculate_atr(closed).iloc[-1])
+    if pd.isna(atr_val) or atr_val <= 0:
+        return
+    risk = risk_notes(levels.get("news", []))
+    if SKIP_RISK_WINDOWS and risk:
+        print(f"[M15 SMC] ข้ามรอบนี้ (ช่วงเสี่ยง): {' / '.join(risk)}")
+        return
+
+    cur = float(df["Close"].iloc[-1])
+    tol = M15_TOL_ATR * atr_val
+    for kind, ev in events.items():
+        if kind == "bos" and not M15_BOS:
+            continue
+        age = len(closed) - 1 - ev["idx"]
+        if age > M15_MAX_AGE:
+            continue
+        buy = ev["side"] == "buy"
+        start = ev["start"]
+        name = "CHoCH" if kind == "choch" else "BOS"
+        after = df.iloc[ev["idx"]:]                      # ตั้งแต่แท่งเบรกจนถึงแท่งสด
+        if buy:
+            extreme = float(after["High"].max())
+            leg = extreme - start
+            z_top, z_bot = extreme - leg * M15_FIB, extreme - leg * M15_FIB_DEEP
+            broken = float(after["Close"].min()) < start
+        else:
+            extreme = float(after["Low"].min())
+            leg = start - extreme
+            z_bot, z_top = extreme + leg * M15_FIB, extreme + leg * M15_FIB_DEEP
+            broken = float(after["Close"].max()) > start
+
+        if buy:
+            ext_pos = int(after["High"].values.argmax())
+        else:
+            ext_pos = int(after["Low"].values.argmin())
+        post = after.iloc[ext_pos + 1:]                  # แท่งหลังทำจุดสุดขอบ = แท่งที่ย้อนกลับมา
+        recent = post.iloc[-M15_TOUCH_BARS:] if len(post) else post
+
+        touched, touch_px = False, None
+        if len(recent):
+            if buy:
+                touch_px = float(recent["Low"].min())
+                touched = touch_px <= z_top + tol and touch_px > start
+            else:
+                touch_px = float(recent["High"].max())
+                touched = touch_px >= z_bot - tol and touch_px < start
+
+        ev_label = fmt(df.index[ev["idx"]])
+        print(f"[M15 SMC] {name} {'BUY' if buy else 'SELL'} แท่ง {ev_label} | ขา {px(start):.2f}→{px(extreme):.2f} "
+              f"| โซน {px(z_bot):.2f}–{px(z_top):.2f} | ราคา {px(cur):.2f} | อายุ {age} แท่ง | "
+              f"ขาพัง={broken} | ชนโซน={touched}")
+        if broken or leg < M15_MIN_LEG_ATR * atr_val or not touched:
+            continue
+
+        entry = cur
+        if buy:
+            sl = start - M15_SL_ATR * atr_val
+            rr = (extreme - entry) / (entry - sl) if entry > sl else 0
+            s_lbl, e_lbl, brk = ("LL", "จุดสูงสุด", "เหนือ LH") if kind == "choch" else ("HL", "จุดสูงสุด", "เหนือ HH")
+        else:
+            sl = start + M15_SL_ATR * atr_val
+            rr = (entry - extreme) / (sl - entry) if sl > entry else 0
+            s_lbl, e_lbl, brk = ("HH", "จุดต่ำสุด", "ใต้ HL") if kind == "choch" else ("LH", "จุดต่ำสุด", "ใต้ LL")
+
+        act = "BUY" if buy else "SELL"
+        zone_txt = f"{M15_FIB * 100:g}–{M15_FIB_DEEP * 100:g}%"
+        title = (f"⚡ <b>[SMC M15] {name} {'ขาขึ้น' if buy else 'ขาลง'} + ราคาย้อนชนโซน {zone_txt} → {act} ทันที</b>")
+        lines = [
+            f"🔓 ปิด{brk} <code>{px(ev['level']):.2f}</code> (แท่ง M15 {ev_label})",
+            f"📏 ขา: {s_lbl} <code>{px(start):.2f}</code> → {e_lbl} <code>{px(extreme):.2f}</code> ({leg:.2f} จุด)",
+            f"🎯 โซน {zone_txt}: <code>{px(z_bot):.2f}</code> – <code>{px(z_top):.2f}</code>",
+            f"📍 ราคาย้อนชนโซนที่ <code>{px(touch_px):.2f}</code> | ราคาตอนนี้ <code>{px(cur):.2f}</code>",
+            f"🛑 SL (เลยจุดเริ่มขา +{M15_SL_ATR:g}×ATR M15 {atr_val:.2f}): <code>{px(sl):.2f}</code> | R:R 1:{rr:.1f}",
+            f"🏁 เป้า ({e_lbl}ของขา): <code>{px(extreme):.2f}</code>",
+            "⏳ แจ้งทันทีที่ชนโซน (ไม่รอ M1 ยืนยัน) ดูแท่งกลับตัวบนกราฟก่อนเข้า",
+        ]
+        parts = [title, f"📊 XAUUSD ({SYMBOL}) | TF M15"] + lines + risk
+        if PRICE_OFFSET:
+            parts.append(f"ℹ️ ราคาแสดงเป็นระดับ MT5 (GC=F − {PRICE_OFFSET:g})")
+        parts.append("📱 <b>เปิด MT5 เช็กกราฟก่อนตัดสินใจ</b>")
+        key = f"m15:{kind}_{ev['side']}"
+        sent_ok = fire(key, f"{df.index[ev['idx']]}|{ev['level']:.2f}", "\n".join(p for p in parts if p))
+        if sent_ok:
+            try:
+                record_signal("m15", kind, ev["side"], entry, extreme, sl, None, None)
+            except Exception as e:
+                print(f"Journal record error: {e}")
 
 
 def _mir(bar):
@@ -2376,8 +2514,9 @@ def _structure_alert(df, closed, ev, atr_val, risk, mode="smc"):
                          "event_time": df.index[ev["idx"]]})
 
 # ==========================================
-# 🧪 สมุดบันทึกสัญญาณ (Signal Journal): จดสัญญาณ SMC/ICT ที่บอทส่ง แล้วตามดูเองว่าชนเป้าหรือ SL ก่อน
+# 🧪 สมุดบันทึกสัญญาณ (Signal Journal): จดสัญญาณ SMC/ICT/SMC M15 ที่บอทส่ง แล้วตามดูเองว่าชนเป้าหรือ SL ก่อน
 # วัดผล 2 แบบต่อสัญญาณ: SL แคบ (เลยแพทเทิร์น M1) และ SL โครงสร้าง / ถ้า SL กับเป้าอยู่แท่ง 5 นาทีเดียวกัน นับเป็น SL
+# (SMC M15 ไม่มี SL แคบ ใช้เฉพาะ SL โครงสร้าง)
 # ใช้ราคา GC=F ตรงๆ (เหมือนส่วนอื่น) แสดงผลเป็นสถิติท้ายสรุปรายสัปดาห์/เดือน/ปี
 # ==========================================
 JOURNAL_ENABLED = os.environ.get("JOURNAL_ENABLED", "1") == "1"
@@ -2466,13 +2605,14 @@ def journal_lines(start_s, end_s):
     if not recs:
         return []
     out = ["", "🧪 <b>สถิติสัญญาณบอท</b> (วัดตามแผน SL/เป้าที่แจ้ง)"]
-    for sy, name in (("smc", "SMC"), ("ict", "ICT")):
+    for sy, name in (("smc", "SMC"), ("ict", "ICT"), ("m15", "SMC M15")):
         rs = [r for r in recs if r["sy"] == sy]
         if not rs:
             continue
         pend = sum(1 for r in rs if _journal_pending(r))
         out.append(f"{name}: {len(rs)} สัญญาณ" + (f" (รอผล {pend})" if pend else ""))
-        out.append(_jline("SL แคบ", [(r, "rt") for r in rs if r["st"] is not None]))
+        if sy != "m15":   # SMC M15 ไม่มี SL แคบจาก M1
+            out.append(_jline("SL แคบ", [(r, "rt") for r in rs if r["st"] is not None]))
         out.append(_jline("SL โครงสร้าง", [(r, "rs") for r in rs]))
         if sy == "ict":
             hi = [(r, "rt") for r in rs if r["st"] is not None and (r["sc"] or 0) >= 4]
@@ -2601,6 +2741,12 @@ def check_market():
         check_ict_retrace(df_4h, levels, last_1h_start)
     except Exception as e:
         print(f"ICT alert error: {e}")
+
+    # 🆕 SMC บน M15: เกิด CHoCH/BOS แล้วราคาย้อนชนโซน 50–61.8% = แจ้งทันที
+    try:
+        check_m15_retrace(levels)
+    except Exception as e:
+        print(f"M15 SMC alert error: {e}")
 
     try:
         push_removals()
