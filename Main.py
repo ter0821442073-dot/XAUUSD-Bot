@@ -442,6 +442,69 @@ def pre_alerted(tf, side, bar_id):
     return any(k.startswith(prefix) and v == bar_id for k, v in sent.items())
 
 
+def _seen_key(tf, kind, level_gc):
+    return f"{tf}:{kind}:{level_gc - PRICE_OFFSET:.2f}"
+
+
+def update_first_seen(levels):
+    """จดเวลาที่บอทเห็นแนวแต่ละเส้นในชีตครั้งแรก (ใช้กันแจ้งเตือนจากการชนที่เกิดก่อนเพิ่มแนว)
+    รอบแรกสุด: แนวที่มีอยู่แล้วถือว่าเป็นแนวเก่า (ไม่บล็อกอะไร) / แนวที่ถูกลบออกจากชีตจะถูกเคลียร์"""
+    first_run = "seen" not in sent
+    seen = sent.setdefault("seen", {})
+    now_txt = str(now_server())
+    cur = set()
+    changed = first_run
+    for tf in ("1h", "4h"):
+        for kind in ("res", "sup"):
+            for v in levels[tf][kind]:
+                k = f"{tf}:{kind}:{v:.2f}"
+                cur.add(k)
+                if k not in seen:
+                    seen[k] = "2000-01-01 00:00:00" if first_run else now_txt
+                    changed = True
+    for k in [k for k in seen if k not in cur]:
+        seen.pop(k, None)
+        changed = True
+    if changed:
+        save_state()
+
+
+def level_known_before(tf, kind, level_gc, ts):
+    """แนวนี้ถูกเพิ่มในชีตก่อนเวลา ts หรือไม่ (ไม่มีบันทึก = ถือว่ามีมาก่อน)"""
+    seen = sent.get("seen", {}).get(_seen_key(tf, kind, level_gc))
+    if not seen:
+        return True
+    try:
+        return pd.Timestamp(seen) <= ts
+    except Exception:
+        return True
+
+
+def level_armed(tf, kind, level_gc, bar_start):
+    """นับการชนแนวในแท่งนี้ได้หรือไม่: แนวมีอยู่ก่อนแท่งเริ่ม = นับ / แนวเพิ่มกลางแท่ง = ต้องมีการชนหลังเวลาที่เพิ่ม
+    (กันเตือนจากการชนที่เกิดไปแล้วก่อนเพิ่มแนว ตอนที่ราคาวิ่งหนีแนวไปไกลแล้ว)"""
+    seen = sent.get("seen", {}).get(_seen_key(tf, kind, level_gc))
+    if not seen:
+        return True
+    try:
+        added = pd.Timestamp(seen)
+    except Exception:
+        return True
+    if added <= bar_start:
+        return True
+    bars = fetch_5m(2)
+    if bars is None:
+        print(f"[{tf.upper()}] แนว {px(level_gc):.2f} เพิ่งเพิ่มกลางแท่ง ดึงข้อมูล 5 นาทีไม่ได้ ข้ามรอบนี้")
+        return False
+    sub = bars[bars.index >= added.floor("5min") + pd.Timedelta(minutes=5)]
+    if sub.empty:
+        return False
+    ok = bool((sub["High"] >= level_gc).any()) if kind == "res" else bool((sub["Low"] <= level_gc).any())
+    if not ok:
+        print(f"[{tf.upper()}] แนว {px(level_gc):.2f} เพิ่มในชีตเมื่อ {fmt(added)} หลังจากชนไปแล้ว → ยังไม่แจ้ง รอชนใหม่")
+    return ok
+
+
 def check_timeframe(tf, df, levels, last_1h_start, k4_now):
     if len(df) < 25:
         return
@@ -491,11 +554,11 @@ def check_timeframe(tf, df, levels, last_1h_start, k4_now):
 
         for side in ("sell", "buy"):
             if side == "sell":
-                hit = [r for r in res_list if l_high >= r]
+                hit = [r for r in res_list if l_high >= r and level_armed(tf, "res", r, df.index[live_i])]
                 level = max(hit) if hit else None   # แนวต้านสูงสุดที่ชนแล้ว
                 stoch_ok = (not need_stoch) or (not pd.isna(k_live) and k_live >= 80)
             else:
-                hit = [s for s in sup_list if l_low <= s]
+                hit = [s for s in sup_list if l_low <= s and level_armed(tf, "sup", s, df.index[live_i])]
                 level = min(hit) if hit else None   # แนวรับต่ำสุดที่ชนแล้ว
                 stoch_ok = (not need_stoch) or (not pd.isna(k_live) and k_live <= 20)
             if level is None:
@@ -538,8 +601,8 @@ def check_timeframe(tf, df, levels, last_1h_start, k4_now):
     cid = str(df.index[cl_i])
     clabel = fmt(df.index[cl_i])
 
-    sell_hit = [r for r in res_list if c_high >= r]
-    buy_hit = [s for s in sup_list if c_low <= s]
+    sell_hit = [r for r in res_list if c_high >= r and level_armed(tf, "res", r, df.index[cl_i])]
+    buy_hit = [s for s in sup_list if c_low <= s and level_armed(tf, "sup", s, df.index[cl_i])]
     sell_level = max(sell_hit) if sell_hit else None
     buy_level = min(buy_hit) if buy_hit else None
 
@@ -1860,9 +1923,9 @@ def check_breaks(tf, df, levels, last_1h_start):
 
     buf = BREAK_CLOSE_BUFFER
     # เบรกขึ้น: แท่งก่อนหน้ายังปิดไม่เหนือแนว และแท่งนี้ "ปิด" เหนือแนว (+buffer)
-    up = [r for r in res_list if pc <= r + buf < c]
+    up = [r for r in res_list if pc <= r + buf < c and level_known_before(tf, "res", r, bar_start + delta)]
     # เบรกลง: แท่งก่อนหน้ายังปิดไม่ใต้แนว และแท่งนี้ "ปิด" ใต้แนว (-buffer)
-    down = [s for s in sup_list if c < s - buf <= pc]
+    down = [s for s in sup_list if c < s - buf <= pc and level_known_before(tf, "sup", s, bar_start + delta)]
 
     # ไส้ทะลุแนวแต่ปิดกลับ = เบรกหลอก ไม่แจ้งเบรก ไม่ลบแนว (แค่ลงล็อก)
     for r in res_list:
@@ -2707,6 +2770,11 @@ def check_market():
         prev = f"\n🔎 ปัญหาที่เคยแจ้ง: {html.escape(sheet_last_err)}" if sheet_last_err else ""
         send_telegram_message("✅ <b>แก้ไขแล้ว</b> อ่าน Google Sheets กลับมาปกติ ช่องที่เคยมีปัญหาอ่านได้แล้ว" + prev)
     sheet_errors, sheet_alerted, sheet_last_err = 0, False, ""
+
+    try:
+        update_first_seen(levels)
+    except Exception as e:
+        print(f"First-seen error: {e}")
 
     try:
         monitor_trades(levels)
