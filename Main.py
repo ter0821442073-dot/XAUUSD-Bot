@@ -43,6 +43,9 @@ H4_LIVE_REQUIRE_STOCH = os.environ.get("H4_LIVE_REQUIRE_STOCH", "0") == "1"
 # Stochastic (K period, Slowing)
 STOCH_K = int(os.environ.get("STOCH_K", "14"))
 STOCH_SLOW = int(os.environ.get("STOCH_SLOW", "3"))
+# โซน Overbought / Oversold ของ Stochastic (ทุกเงื่อนไขที่เคยใช้ 80/20 อ้างอิงค่านี้)
+STOCH_OB = float(os.environ.get("STOCH_OB", "90"))
+STOCH_OS = float(os.environ.get("STOCH_OS", "10"))
 
 # 1) กันเตือนทันทีซ้ำรัว: เตือนฝั่งเดิมใหม่ได้เมื่อผ่านไปกี่แท่ง (เปลี่ยนทิศ = รีเซ็ต)
 COOLDOWN_BARS = {
@@ -692,6 +695,62 @@ def level_armed(tf, kind, level_gc, bar_start):
     return ok
 
 
+def pinbar_side(o, h, l, c):
+    """ตรวจแท่งเดี่ยวว่าเป็น Pinbar หรือไม่ (เกณฑ์เดียวกับ candle_patterns)
+    คืน ("buy", ไส้ล่าง/ช่วงแท่ง) = Hammer / ("sell", ไส้บน/ช่วงแท่ง) = Shooting Star / None = ไม่ใช่"""
+    rng = h - l
+    if rng <= 0:
+        return None
+    body_s = max(abs(c - o), 0.01)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+    if lower >= PIN_WICK_RATIO * body_s and lower >= PIN_WICK_PCT * rng and upper <= PIN_OPP_PCT * rng:
+        return "buy", lower / rng
+    if upper >= PIN_WICK_RATIO * body_s and upper >= PIN_WICK_PCT * rng and lower <= PIN_OPP_PCT * rng:
+        return "sell", upper / rng
+    return None
+
+
+def alert_pinbar_1h(df, cl_i, stoch_k, atr_val, res_list, sup_list, k4_now, risk):
+    """1H: แท่งที่ปิดแล้วเป็น Pinbar = แจ้งเตือนทันที (ครั้งเดียวต่อแท่ง) ไม่ขึ้นกับเงื่อนไขอื่น"""
+    o, h, l, c = ohlc(df, cl_i)
+    pin = pinbar_side(o, h, l, c)
+    if pin is None:
+        return
+    side, wick_pct = pin
+    cid = str(df.index[cl_i])
+    clabel = fmt(df.index[cl_i])
+    k = float(stoch_k.iloc[cl_i])
+    k_txt = "-" if pd.isna(k) else f"{k:.1f}"
+    rng = h - l
+    body = abs(c - o)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+
+    if side == "buy":
+        title = "📌 <b>1H ปิดแท่ง Pinbar ขาขึ้น (Hammer) - เตือนทันที</b>"
+        wick_line = f"📉 ไส้ล่างยาว {wick_pct:.0%} ของแท่ง (ปฏิเสธราคาด้านล่าง)"
+        if not pd.isna(k) and k <= STOCH_OS:
+            wick_line += " + ตรงโซน Oversold"
+    else:
+        title = "📌 <b>1H ปิดแท่ง Pinbar ขาลง (Shooting Star) - เตือนทันที</b>"
+        wick_line = f"📈 ไส้บนยาว {wick_pct:.0%} ของแท่ง (ปฏิเสธราคาด้านบน)"
+        if not pd.isna(k) and k >= STOCH_OB:
+            wick_line += " + ตรงโซน Overbought"
+
+    lines = [
+        f"O <code>{px(o):.2f}</code> | H <code>{px(h):.2f}</code> | L <code>{px(l):.2f}</code> | C <code>{px(c):.2f}</code>",
+        wick_line,
+        f"📏 ช่วงแท่ง {rng:.2f} | ตัว {body:.2f} | ไส้บน {upper:.2f} | ไส้ล่าง {lower:.2f}",
+        f"📉 Stoch %K: <code>{k_txt}</code>",
+    ]
+    zone_txt = zone_label(side, k4_now)[0]
+    target = next_target(side, c, sup_list, res_list)
+    msg = compose(title, clabel, lines, side, c, atr_val, target, zone_txt, risk,
+                  "ℹ️ Pinbar เป็นสัญญาณกลับตัวเบื้องต้น ดูแนวรับ/ต้านและโครงสร้างประกอบก่อนเข้า")
+    fire(f"1h:pinbar_{side}", cid, msg)
+
+
 def check_timeframe(tf, df, levels, last_1h_start, k4_now):
     if len(df) < 25:
         return
@@ -743,11 +802,11 @@ def check_timeframe(tf, df, levels, last_1h_start, k4_now):
             if side == "sell":
                 hit = [r for r in res_list if l_high >= r and level_armed(tf, "res", r, df.index[live_i])]
                 level = max(hit) if hit else None   # แนวต้านสูงสุดที่ชนแล้ว
-                stoch_ok = (not need_stoch) or (not pd.isna(k_live) and k_live >= 80)
+                stoch_ok = (not need_stoch) or (not pd.isna(k_live) and k_live >= STOCH_OB)
             else:
                 hit = [s for s in sup_list if l_low <= s and level_armed(tf, "sup", s, df.index[live_i])]
                 level = min(hit) if hit else None   # แนวรับต่ำสุดที่ชนแล้ว
-                stoch_ok = (not need_stoch) or (not pd.isna(k_live) and k_live <= 20)
+                stoch_ok = (not need_stoch) or (not pd.isna(k_live) and k_live <= STOCH_OS)
             if level is None:
                 continue
             cd_ok = cooldown_ok(tf, side, level, df.index[live_i], delta)
@@ -779,6 +838,14 @@ def check_timeframe(tf, df, levels, last_1h_start, k4_now):
     # ---------- แท่งที่ปิดแล้ว: ยืนยันแท่งคู่ / Stoch ตัดกลับ ----------
     if len(df) < abs(pv_i):
         return
+
+    # 🆕 1H: แท่งที่ปิดแล้วเป็น Pinbar = แจ้งเตือนทันที (แยกจากเงื่อนไขยืนยันด้านล่าง)
+    if tf == "1h":
+        try:
+            alert_pinbar_1h(df, cl_i, stoch_k, atr_val, res_list, sup_list, k4_now, risk)
+        except Exception as e:
+            print(f"[1H] Pinbar alert error: {e}")
+
     c_open, c_high, c_low, c_close = ohlc(df, cl_i)
     p_open, _, _, p_close = ohlc(df, pv_i)
     k_c, k_p = float(stoch_k.iloc[cl_i]), float(stoch_k.iloc[pv_i])
@@ -807,7 +874,7 @@ def check_timeframe(tf, df, levels, last_1h_start, k4_now):
 
     print(f"[{tf_u}] ปิด {clabel} H:{c_high:.2f} L:{c_low:.2f} C:{c_close:.2f} | %K {k_c:.1f} (ก่อนหน้า {k_p:.1f}) | ATR {atr_val:.2f}")
 
-    if sell_level is not None and (k_c >= 80 or sell_pre_alerted) and sell_pat and sell_zone_ok:
+    if sell_level is not None and (k_c >= STOCH_OB or sell_pre_alerted) and sell_pat and sell_zone_ok:
         lines = [
             f"📈 High: <code>{px(c_high):.2f}</code> ชนแนวต้าน <code>{px(sell_level):.2f}</code>",
             f"💵 ราคาปิด: <code>{px(c_close):.2f}</code> (ห่างแนวต้าน {sell_level - c_close:.2f})",
@@ -817,16 +884,16 @@ def check_timeframe(tf, df, levels, last_1h_start, k4_now):
              compose(f"🚨 <b>ยืนยัน SELL (ชนแนวต้าน + Stoch + ปิดแท่งคู่) - TF {tf_u}</b>",
                      clabel, lines, "sell", c_close, atr_val,
                      next_target("sell", c_close, sup_list, res_list), z_sell_txt, risk))
-    elif tf == "4h" and k_p >= 80 and k_c < 80:
+    elif tf == "4h" and k_p >= STOCH_OB and k_c < STOCH_OB:
         lines = [
-            f"📉 %K: <code>{k_p:.1f}</code> ➡️ <code>{k_c:.1f}</code> (&lt; 80)",
+            f"📉 %K: <code>{k_p:.1f}</code> ➡️ <code>{k_c:.1f}</code> (&lt; {STOCH_OB:g})",
             f"💵 ราคาปิด: <code>{px(c_close):.2f}</code>",
         ]
         fire("4h:cross_sell", cid,
              compose("🚨 <b>สัญญาณ SELL (Stoch ตัดกลับ) - TF 4H</b>",
                      clabel, lines, "sell", c_close, atr_val,
                      next_target("sell", c_close, sup_list, res_list), "", risk))
-    elif buy_level is not None and (k_c <= 20 or buy_pre_alerted) and buy_pat and buy_zone_ok:
+    elif buy_level is not None and (k_c <= STOCH_OS or buy_pre_alerted) and buy_pat and buy_zone_ok:
         lines = [
             f"📉 Low: <code>{px(c_low):.2f}</code> ชนแนวรับ <code>{px(buy_level):.2f}</code>",
             f"💵 ราคาปิด: <code>{px(c_close):.2f}</code> (ห่างแนวรับ {c_close - buy_level:.2f})",
@@ -836,9 +903,9 @@ def check_timeframe(tf, df, levels, last_1h_start, k4_now):
              compose(f"🟢 <b>ยืนยัน BUY (ชนแนวรับ + Stoch + ปิดแท่งคู่) - TF {tf_u}</b>",
                      clabel, lines, "buy", c_close, atr_val,
                      next_target("buy", c_close, sup_list, res_list), z_buy_txt, risk))
-    elif tf == "4h" and k_p <= 20 and k_c > 20:
+    elif tf == "4h" and k_p <= STOCH_OS and k_c > STOCH_OS:
         lines = [
-            f"📈 %K: <code>{k_p:.1f}</code> ➡️ <code>{k_c:.1f}</code> (&gt; 20)",
+            f"📈 %K: <code>{k_p:.1f}</code> ➡️ <code>{k_c:.1f}</code> (&gt; {STOCH_OS:g})",
             f"💵 ราคาปิด: <code>{px(c_close):.2f}</code>",
         ]
         fire("4h:cross_buy", cid,
@@ -1886,12 +1953,12 @@ def candle_patterns(prev, cur, k=None):
     bear_pin = upper >= PIN_WICK_RATIO * body_s and upper >= PIN_WICK_PCT * rng and lower <= PIN_OPP_PCT * rng
     if bull_pin:
         t = f"📌 Pinbar ขาขึ้น (Hammer) ไส้ล่างยาว {lower / rng:.0%} ของแท่ง"
-        if has_k and k <= 20:
+        if has_k and k <= STOCH_OS:
             t += " + ตรงโซน Oversold"
         pats.append(t)
     elif bear_pin:
         t = f"📌 Pinbar ขาลง (Shooting Star) ไส้บนยาว {upper / rng:.0%} ของแท่ง"
-        if has_k and k >= 80:
+        if has_k and k >= STOCH_OB:
             t += " + ตรงโซน Overbought"
         pats.append(t)
 
@@ -1969,10 +2036,10 @@ def maybe_send_h4_close(df_1h, df_4h):
     kp_txt = "-" if pd.isna(k_prev) else f"{k_prev:.1f}"
     if pd.isna(k):
         zone = ""
-    elif k >= 80:
-        zone = "🔥 Overbought (≥80)"
-    elif k <= 20:
-        zone = "🧊 Oversold (≤20)"
+    elif k >= STOCH_OB:
+        zone = f"🔥 Overbought (≥{STOCH_OB:g})"
+    elif k <= STOCH_OS:
+        zone = f"🧊 Oversold (≤{STOCH_OS:g})"
     else:
         zone = "↔️ อยู่ระหว่างโซน"
 
