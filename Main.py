@@ -1,3 +1,10 @@
+# >>> SMC1D PATCH (ลบบล็อกนี้เพื่อถอนแพทช์)
+try:
+    import smc_1d_alert as _smc1d
+    _smc1d.start_background()
+except Exception as _e:
+    print('[SMC1D] เริ่มไม่สำเร็จ:', _e)
+# <<< SMC1D PATCH
 import io
 import os
 import sys
