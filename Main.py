@@ -2297,6 +2297,115 @@ M15_LIVE_GRACE_SEC = int(os.environ.get("M15_LIVE_GRACE_SEC", "120"))  # Yahoo �
 _m15_cache = {"ts": 0.0, "df": None}
 
 
+import numpy as np
+
+OBFVG_REQUIRE = os.environ.get("OBFVG_REQUIRE", "1") == "1"          # 0 = ปิดเงื่อนไข FVG+OB (กลับไปแบบเดิม)
+OBFVG_BOS = os.environ.get("OBFVG_BOS", "1") == "1"                  # 1 = บังคับกับ BOS ด้วย / 0 = บังคับเฉพาะ CHoCH
+OB_USE_BODY = os.environ.get("OB_USE_BODY", "0") == "1"              # 1 = OB วัดเฉพาะตัวแท่ง / 0 = รวมไส้
+OB_NEED_ZONE = os.environ.get("OB_NEED_ZONE", "0") == "1"            # 1 = OB ต้องซ้อนโซน 50–61.8% ด้วย
+FVG_DISP_ATR = float(os.environ.get("FVG_DISP_ATR", "1.0"))          # แท่งกลาง FVG ตัวต้อง >= กี่เท่า ATR
+FVG_BODY_PCT = float(os.environ.get("FVG_BODY_PCT", "0.70"))         # ตัวแท่งต้อง >= กี่ส่วนของช่วงแท่ง (ไส้รวมไม่เกิน 30%)
+FVG_ZONE_TOL_ATR = float(os.environ.get("FVG_ZONE_TOL_ATR", "0.1")) # เผื่อขอบโซน (เท่า ATR)
+
+
+def smc_leg_fvg_ob(df, ev, buy, z_bot, z_top, atr_val):
+    """หา FVG (แท่งวิ่งแรง + อยู่ในโซน/ลึกกว่าโซน) และ OB ภายในขา ใช้แท่งที่ปิดแล้วเท่านั้น"""
+    hi, lo = df["High"].values, df["Low"].values
+    op, cl = df["Open"].values, df["Close"].values
+    n, j = len(df), ev["idx"]
+    out = {"fvg": None, "fvg_x": None, "fvg_pct": None, "ob": None, "fvg_seen": 0}
+    if j >= n or atr_val is None or atr_val <= 0:
+        return out
+
+    # จุดเริ่มขา = แท่ง Swing Low (BUY) / Swing High (SELL)
+    a = max(0, j - 60)
+    seg = lo[a:j + 1] if buy else hi[a:j + 1]
+    s_idx = a + int(np.abs(seg - ev["start"]).argmin())
+    # จุดสุดขอบของขา = High สูงสุด (BUY) / Low ต่ำสุด (SELL) ตั้งแต่แท่งเบรก
+    e_idx = j + (int(hi[j:].argmax()) if buy else int(lo[j:].argmin()))
+    if e_idx - s_idx < 2:
+        return out
+
+    mid = (z_bot + z_top) / 2
+    tol = FVG_ZONE_TOL_ATR * atr_val
+
+    # ---- FVG: แท่งกลางวิ่งแรง + ช่องว่างอยู่ในโซน/ลึกกว่าโซน ----
+    cands = []
+    for i in range(s_idx + 1, e_idx):
+        rng = hi[i] - lo[i]
+        if rng <= 0:
+            continue
+        body = abs(cl[i] - op[i])
+        if (cl[i] > op[i]) != buy:                 # แท่งกลางต้องสีตรงทิศ (BUY เขียว / SELL แดง)
+            continue
+        if body < FVG_DISP_ATR * atr_val or body / rng < FVG_BODY_PCT:
+            continue                               # ไม่ใช่แท่งวิ่งแรง / ไส้เยอะ
+        if buy and hi[i - 1] < lo[i + 1]:
+            g_lo, g_hi = float(hi[i - 1]), float(lo[i + 1])
+        elif (not buy) and lo[i - 1] > hi[i + 1]:
+            g_lo, g_hi = float(hi[i + 1]), float(lo[i - 1])
+        else:
+            continue
+        out["fvg_seen"] += 1
+        # ตำแหน่ง: BUY ต้องอยู่ในโซนหรือต่ำกว่า / SELL ต้องอยู่ในโซนหรือสูงกว่า
+        if buy and g_hi > z_top + tol:
+            continue
+        if (not buy) and g_lo < z_bot - tol:
+            continue
+        # ยังไม่ถูกปิดทะลุหมดช่อง
+        later = cl[i + 2:]
+        if len(later):
+            if buy and later.min() < g_lo:
+                continue
+            if (not buy) and later.max() > g_hi:
+                continue
+        cands.append((g_lo, g_hi, body / atr_val, body / rng))
+    if cands:   # เลือกอันที่ใกล้กลางโซนที่สุด
+        g = min(cands, key=lambda c: abs((c[0] + c[1]) / 2 - mid))
+        out["fvg"], out["fvg_x"], out["fvg_pct"] = (g[0], g[1]), g[2], g[3]
+
+    # ---- OB: แท่งสวนทางสุดท้ายก่อนแรงวิ่ง (ช่วง start..แท่งเบรก) ที่ยังไม่ถูกปิดทะลุ ----
+    for i in range(j - 1, s_idx - 1, -1):
+        is_opp = (cl[i] < op[i]) if buy else (cl[i] > op[i])
+        if not is_opp:
+            continue
+        o_lo = min(op[i], cl[i]) if OB_USE_BODY else lo[i]
+        o_hi = max(op[i], cl[i]) if OB_USE_BODY else hi[i]
+        later = cl[i + 1:]
+        if len(later):
+            if buy and later.min() < o_lo:
+                continue
+            if (not buy) and later.max() > o_hi:
+                continue
+        if OB_NEED_ZONE and not (o_lo <= z_top + tol and o_hi >= z_bot - tol):
+            continue
+        out["ob"] = (float(o_lo), float(o_hi))
+        break
+    return out
+
+
+def obfvg_gate(df, ev, buy, z_bot, z_top, tag, atr_val):
+    """คืน (ผ่านไหม, บรรทัดแสดงผล) ผ่าน = มีทั้ง FVG (วิ่งแรง + อยู่ในโซน/ลึกกว่า) และ OB"""
+    if not OBFVG_REQUIRE or (ev["kind"] == "bos" and not OBFVG_BOS):
+        return True, []
+    info = smc_leg_fvg_ob(df, ev, buy, z_bot, z_top, atr_val)
+    name = "CHoCH" if ev["kind"] == "choch" else "BOS"
+    if info["fvg"] is None or info["ob"] is None:
+        miss = []
+        if info["fvg"] is None:
+            miss.append("FVG(วิ่งแรง+อยู่ในโซน/ลึกกว่า)" + (f" [เจอ FVG วิ่งแรง {info['fvg_seen']} อัน แต่อยู่นอกโซน/ถูกปิดทะลุ]" if info["fvg_seen"] else ""))
+        if info["ob"] is None:
+            miss.append("OB")
+        print(f"[{tag}] {name} {'BUY' if buy else 'SELL'}: ไม่พบ {' + '.join(miss)} → ยังไม่แจ้ง")
+        return False, []
+    f, o = info["fvg"], info["ob"]
+    return True, [
+        f"🟦 FVG (แท่งวิ่งแรง {info['fvg_x']:.1f}×ATR ตัว {info['fvg_pct']:.0%}): "
+        f"<code>{px(f[0]):.2f}</code> – <code>{px(f[1]):.2f}</code>",
+        f"🟧 OB ({'แดง' if buy else 'เขียว'}สุดท้ายก่อนวิ่ง): <code>{px(o[0]):.2f}</code> – <code>{px(o[1]):.2f}</code>",
+    ]
+
+
 def find_structure(df, n):
     """สแกนแท่งที่ปิดแล้ว คืน {"choch": เหตุการณ์ล่าสุด, "bos": เหตุการณ์ล่าสุด}
     เหตุการณ์ = {kind, side, idx, level, start} จุดสวิงยืนยันหลังผ่านไป n แท่ง และนับเฉพาะ H/L สลับกัน"""
@@ -2490,6 +2599,10 @@ def check_m15_retrace(levels):
         if broken or leg < M15_MIN_LEG_ATR * atr_val or not touched:
             continue
 
+        ok_x, obfvg_lines = obfvg_gate(closed, ev, buy, z_bot, z_top, "M15 SMC", atr_val)
+        if not ok_x:
+            continue
+
         entry = cur
         if buy:
             sl = start - M15_SL_ATR * atr_val
@@ -2510,6 +2623,7 @@ def check_m15_retrace(levels):
             f"📍 ราคาย้อนชนโซนที่ <code>{px(touch_px):.2f}</code> | ราคาตอนนี้ <code>{px(cur):.2f}</code>",
             f"🛑 SL (เลยจุดเริ่มขา +{M15_SL_ATR:g}×ATR M15 {atr_val:.2f}): <code>{px(sl):.2f}</code> | R:R 1:{rr:.1f}",
             f"🏁 เป้า ({e_lbl}ของขา): <code>{px(extreme):.2f}</code>",
+            *obfvg_lines,
             "⏳ แจ้งทันทีที่ชนโซน (ไม่รอ M1 ยืนยัน) ดูแท่งกลับตัวบนกราฟก่อนเข้า",
         ]
         parts = [title, f"📊 XAUUSD ({SYMBOL}) | TF M15"] + lines + risk
@@ -2751,6 +2865,12 @@ def _structure_alert(df, closed, ev, atr_val, risk, mode="smc"):
     if SKIP_RISK_WINDOWS and risk:
         return
 
+    obfvg_lines = []
+    if not ict:   # เงื่อนไขใหม่ใช้กับ SMC เท่านั้น (ICT มีเช็ก FVG ของตัวเอง)
+        ok_x, obfvg_lines = obfvg_gate(closed, ev, buy, z_bot, z_top, "4H SMC", atr_val)
+        if not ok_x:
+            return
+
     ict_lines = []
     if ict:   # เงื่อนไขบังคับของระบบ ICT (ก่อนไปขอข้อมูล M1)
         ict_lines, fl = ict_confluence(closed, ev, buy, atr_val, z_bot, z_top, start)
@@ -2814,6 +2934,7 @@ def _structure_alert(df, closed, ev, atr_val, risk, mode="smc"):
         lines.append(f"💵 ราคาตอนนี้: <code>{px(cur):.2f}</code>")
         lines.append(f"🛑 SL (เลยจุดเริ่มขา +{SMC_SL_ATR:g}×ATR {atr_val:.2f}): <code>{px(sl):.2f}</code> | R:R 1:{rr:.1f}")
     lines.append(f"🏁 เป้า ({e_lbl}ของขา): <code>{px(extreme):.2f}</code>")
+    lines += obfvg_lines
     lines += ict_lines
     parts = [title, f"📊 XAUUSD ({SYMBOL}) | TF 4H"] + lines + risk
     if PRICE_OFFSET:
