@@ -263,6 +263,123 @@ def fetch_5m(days):
     return m
 
 
+# ---------- 🆕 แจ้งเตือนล่วงหน้า "เตรียมเข้าโซน 50–61.8%" (M15 + H4): CHoCH + FVG + แท่งปิดกลับ ก่อนราคาเข้าโซน ----------
+# BUY : CHoCH ขาขึ้น -> มี FVG ในขา -> ทำจุดสูงสุด -> มีแท่งแดงปิดกลับ -> ราคายังอยู่เหนือโซน = แจ้ง "รอ BUY ที่โซน"
+# SELL: CHoCH ขาลง  -> มี FVG ในขา -> ทำจุดต่ำสุด -> มีแท่งเขียวปิดกลับ -> ราคายังอยู่ใต้โซน = แจ้ง "รอ SELL ที่โซน"
+# OB (แท่งสวนทางล่าสุดก่อนแรงเบรก) ไม่บังคับ ถ้ามีจะแสดงเสริม / ตั้ง EARLY_REQUIRE_FVG=0 = มี FVG หรือ OB อย่างใดอย่างหนึ่งก็แจ้ง
+EARLY_ALERT = os.environ.get("EARLY_ALERT", "1") == "1"                  # 0 = ปิดการแจ้งเตือนล่วงหน้าทั้งชุด
+EARLY_BOS = os.environ.get("EARLY_BOS", "0") == "1"                      # 1 = รวม BOS (ค่าเริ่มต้นเฉพาะ CHoCH)
+EARLY_REQUIRE_FVG = os.environ.get("EARLY_REQUIRE_FVG", "1") == "1"      # 1 = ต้องมี FVG / 0 = FVG หรือ OB อย่างใดอย่างหนึ่ง
+EARLY_NEAR_ATR = float(os.environ.get("EARLY_NEAR_ATR", "0"))            # >0 = แจ้งเฉพาะตอนราคาห่างโซนไม่เกินกี่เท่า ATR (0 = ไม่จำกัด)
+
+
+def _early_zone_alert(tf_key, tf_name, df, closed, ev, atr_val, risk, fib, fib_deep, min_leg_atr, max_age):
+    if not EARLY_ALERT:
+        return
+    kind = ev["kind"]
+    if kind == "bos" and not EARLY_BOS:
+        return
+    if SKIP_RISK_WINDOWS and risk:
+        return
+    j = ev["idx"]
+    n_closed, n = len(closed), len(df)
+    if n_closed - 1 - j > max_age:
+        return
+    buy, start = ev["side"] == "buy", ev["start"]
+    hi, lo = df["High"].values, df["Low"].values
+    op, cl = df["Open"].values, df["Close"].values
+
+    a = max(0, j - 30)
+    win = lo[a:j + 1] if buy else hi[a:j + 1]
+    k = a + int(abs(win - start).argmin())                       # แท่งจุดเริ่มขา
+    e = j + (int(hi[j:].argmax()) if buy else int(lo[j:].argmin()))   # แท่งจุดสุดขอบของขา
+    extreme = float(hi[e] if buy else lo[e])
+    leg = (extreme - start) if buy else (start - extreme)
+    if leg < min_leg_atr * atr_val:
+        return
+    if (cl[j:].min() < start) if buy else (cl[j:].max() > start):
+        return   # ขาพัง
+
+    if buy:
+        z_top, z_bot = extreme - leg * fib, extreme - leg * fib_deep
+    else:
+        z_bot, z_top = extreme + leg * fib, extreme + leg * fib_deep
+    cur = float(cl[-1])
+
+    # ยังไม่เข้าโซน: แท่งหลังจุดสุดขอบทั้งหมดต้องยังไม่แตะโซน
+    after_e = slice(e + 1, n)
+    if e + 1 < n:
+        if buy and float(lo[after_e].min()) <= z_top:
+            return
+        if (not buy) and float(hi[after_e].max()) >= z_bot:
+            return
+    dist = (cur - z_top) if buy else (z_bot - cur)
+    if dist <= 0:
+        return
+    if EARLY_NEAR_ATR > 0 and dist > EARLY_NEAR_ATR * atr_val:
+        return
+
+    # แท่งปิดกลับ: แท่งที่ปิดล่าสุดต้องอยู่หลังจุดสุดขอบ และสีสวนทางกับขา
+    c = n_closed - 1
+    if c <= e:
+        return
+    if (cl[c] >= op[c]) if buy else (cl[c] <= op[c]):
+        return
+
+    # FVG ในขา (ช่องว่างระหว่างแท่ง i-1 กับ i+1 ตามทิศขา)
+    fvg = None
+    for i in range(e - 1, k, -1):
+        g_lo, g_hi = (hi[i - 1], lo[i + 1]) if buy else (hi[i + 1], lo[i - 1])
+        if g_lo < g_hi:
+            fvg = (float(g_lo), float(g_hi))
+            break
+    # OB: แท่งสวนทางล่าสุดก่อนแรงเบรก
+    ob = None
+    for i in range(j, k - 1, -1):
+        if (cl[i] < op[i]) if buy else (cl[i] > op[i]):
+            ob = (float(lo[i]), float(hi[i]))
+            break
+    if EARLY_REQUIRE_FVG:
+        if fvg is None:
+            return
+    elif fvg is None and ob is None:
+        return
+
+    act = "BUY" if buy else "SELL"
+    name = "CHoCH" if kind == "choch" else "BOS"
+    zone_txt = f"{fib * 100:g}–{fib_deep * 100:g}%"
+    sl = (start - SMC_SL_ATR * atr_val) if buy else (start + SMC_SL_ATR * atr_val)
+    z_mid = (z_top + z_bot) / 2
+    rr = (abs(extreme - z_mid) / abs(z_mid - sl)) if abs(z_mid - sl) > 0 else 0
+    tags = [t for t, v in (("FVG", fvg), ("OB", ob)) if v]
+    title = (f"🔔 <b>[SMC {tf_name}] {name} {'ขาขึ้น' if buy else 'ขาลง'} + {' + '.join(tags)} "
+             f"+ แท่ง{'แดง' if buy else 'เขียว'}ปิดกลับ → เตรียมเข้าโซน {zone_txt} รอ {act}</b>")
+    lines = [
+        f"🔓 ปิด{'เหนือ LH' if buy else 'ใต้ HL'} <code>{px(ev['level']):.2f}</code> (แท่ง {fmt(df.index[j])})",
+        f"📏 ขา: {'LL' if buy else 'HH'} <code>{px(start):.2f}</code> → {'จุดสูงสุด' if buy else 'จุดต่ำสุด'} <code>{px(extreme):.2f}</code> ({leg:.2f} จุด)",
+        f"🎯 โซน {zone_txt}: <code>{px(z_bot):.2f}</code> – <code>{px(z_top):.2f}</code>",
+        f"🕯 แท่งปิดกลับ {fmt(df.index[c])}: <code>{px(float(op[c])):.2f}</code> → <code>{px(float(cl[c])):.2f}</code>",
+        f"💵 ราคาตอนนี้: <code>{px(cur):.2f}</code> (ห่างโซน {dist:.2f} จุด / {dist / atr_val:.1f}×ATR)",
+    ]
+    if fvg:
+        ov = fvg[0] <= z_top and fvg[1] >= z_bot
+        lines.append(f"🟦 FVG: <code>{px(fvg[0]):.2f}</code> – <code>{px(fvg[1]):.2f}</code>" + (" (ซ้อนโซน)" if ov else ""))
+    if ob:
+        ov = ob[0] <= z_top and ob[1] >= z_bot
+        lines.append(f"🧱 OB: <code>{px(ob[0]):.2f}</code> – <code>{px(ob[1]):.2f}</code>" + (" (ซ้อนโซน)" if ov else ""))
+    lines += [
+        f"🛑 SL (เลยจุดเริ่มขา +{SMC_SL_ATR:g}×ATR {atr_val:.2f}): <code>{px(sl):.2f}</code> | R:R ที่กลางโซน 1:{rr:.1f}",
+        f"🏁 เป้า: <code>{px(extreme):.2f}</code>",
+        "⏳ ยังไม่เข้าโซน แจ้งล่วงหน้า รอราคาย้อนเข้าโซนแล้วดูแท่งยืนยัน",
+    ]
+    parts = [title, f"📊 XAUUSD ({SYMBOL}) | TF {tf_name}"] + lines + risk
+    if PRICE_OFFSET:
+        parts.append(f"ℹ️ ราคาแสดงเป็นระดับ MT5 (GC=F − {PRICE_OFFSET:g})")
+    parts.append("📱 <b>เปิด MT5 เช็กกราฟก่อนตัดสินใจ</b>")
+    fire(f"early:{tf_key}:{kind}_{ev['side']}", f"{df.index[j]}|{ev['level']:.2f}",
+         "\n".join(p for p in parts if p))
+
+
 def fetch_1m():
     if not FEED_ENABLED:
         return _fetch_1m_yahoo()
@@ -2479,6 +2596,11 @@ def check_choch_retrace(df, levels, last_1h_start):
     for kind, ev in events.items():
         if kind == "bos" and not SMC_BOS:
             continue
+        try:
+            _early_zone_alert("4h", "H4", df, closed, ev, atr_val, risk,
+                              SMC_FIB, SMC_FIB_DEEP, SMC_MIN_LEG_ATR, SMC_MAX_AGE)
+        except Exception as e:
+            print(f"Early H4 error: {e}")
         _structure_alert(df, closed, ev, atr_val, risk)
 
 
@@ -2603,6 +2725,11 @@ def check_m15_retrace(levels):
         print(f"[M15 SMC] {name} {'BUY' if buy else 'SELL'} แท่ง {ev_label} | ขา {px(start):.2f}→{px(extreme):.2f} "
               f"| โซน {px(z_bot):.2f}–{px(z_top):.2f} | ราคา {px(cur):.2f} | อายุ {age} แท่ง | "
               f"ขาพัง={broken} | ชนโซน={touched}")
+        try:
+            _early_zone_alert("m15", "M15", df, closed, ev, atr_val, risk,
+                              M15_FIB, M15_FIB_DEEP, M15_MIN_LEG_ATR, M15_MAX_AGE)
+        except Exception as e:
+            print(f"Early M15 error: {e}")
         if broken or leg < M15_MIN_LEG_ATR * atr_val or not touched:
             continue
 
