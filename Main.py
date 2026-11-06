@@ -380,6 +380,214 @@ def _early_zone_alert(tf_key, tf_name, df, closed, ev, atr_val, risk, fib, fib_d
          "\n".join(p for p in parts if p))
 
 
+# ---------- ข้อมูล D1 (สร้างจาก 1H ตามเวลา MT5) ----------
+D1_OFFSET_HOURS = int(os.environ.get("D1_OFFSET_HOURS", "0"))          # แท่ง D1 เริ่มกี่โมงของเวลา MT5 (0 = เที่ยงคืน MT5)
+D1_SWING = int(os.environ.get("D1_SWING", str(SMC_SWING)))             # จุดสวิงของ D1
+D1_MAX_AGE = int(os.environ.get("D1_MAX_AGE", "10"))                   # CHoCH เก่าสุดกี่แท่ง D1 (10 = 10 วัน)
+_d1_cache = {"ts": 0.0, "df": None}
+
+
+def fetch_d1():
+    """แท่ง D1 สร้างจากข้อมูล 1H ย้อนหลัง 1 ปี (ตามเวลา MT5) แคช 10 นาที"""
+    c = _d1_cache
+    if c["df"] is not None and time.time() - c["ts"] < 600:
+        return c["df"]
+    df = yf.download(SYMBOL, period="1y", interval="1h", progress=False, auto_adjust=False, timeout=30)
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df[["Open", "High", "Low", "Close"]].dropna()
+    df.index = to_server_index(df.index)
+    df = df[~df.index.duplicated(keep="last")]
+    d1 = (
+        df.resample("1D", offset=f"{D1_OFFSET_HOURS}h")
+        .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"})
+        .dropna()
+    )
+    c.update(ts=time.time(), df=d1)
+    return d1
+
+
+# ---------- 🆕 SMC รวมศูนย์ M15 + H4 + D1: CHoCH -> ย้อนชนโซน 50–61.8% = แจ้งทันที + เช็กลิสต์ FVG / แท่งวิ่งแรง / OB ----------
+SMC_UNIFIED = os.environ.get("SMC_UNIFIED", "1") == "1"                  # 0 = กลับไปใช้ SMC 4H (รอ M1) + SMC M15 แบบเดิม
+SMC_TFS = {x.strip().upper() for x in os.environ.get("SMC_TFS", "M15,H4,D1").split(",") if x.strip()}
+SMC_TOUCH_BARS = int(os.environ.get("SMC_TOUCH_BARS", "2"))              # นับการชนโซนจากกี่แท่งล่าสุด (รวมแท่งสด) กันแจ้งของเก่า
+SMC_DISP_ATR = float(os.environ.get("SMC_DISP_ATR", "1.0"))              # แท่งวิ่งแรง = ตัวแท่งตามทิศขา >= กี่เท่า ATR
+
+
+def _smc_alert(tf_key, tf_name, df, closed, ev, atr_val, risk):
+    kind = ev["kind"]
+    j = ev["idx"]
+    n = len(df)
+    buy, start = ev["side"] == "buy", ev["start"]
+    hi, lo = df["High"].values, df["Low"].values
+    op, cl = df["Open"].values, df["Close"].values
+
+    a = max(0, j - 30)
+    win = lo[a:j + 1] if buy else hi[a:j + 1]
+    k = a + int(abs(win - start).argmin())                            # แท่งจุดเริ่มขา
+    e = j + (int(hi[j:].argmax()) if buy else int(lo[j:].argmin()))   # แท่งจุดสุดขอบของขา
+    extreme = float(hi[e] if buy else lo[e])
+    leg = (extreme - start) if buy else (start - extreme)
+    name = "CHoCH" if kind == "choch" else "BOS"
+    if leg < SMC_MIN_LEG_ATR * atr_val:
+        return
+    if (cl[j:].min() < start) if buy else (cl[j:].max() > start):
+        return   # ขาพัง
+
+    if buy:
+        z_top, z_bot = extreme - leg * SMC_FIB, extreme - leg * SMC_FIB_DEEP
+    else:
+        z_bot, z_top = extreme + leg * SMC_FIB, extreme + leg * SMC_FIB_DEEP
+    cur = float(cl[-1])
+    tol = SMC_TOL_ATR * atr_val
+    if e + 1 >= n:
+        return
+    if buy:
+        touch_px = float(lo[e + 1:][-SMC_TOUCH_BARS:].min())
+        touched = start < touch_px <= z_top + tol
+    else:
+        touch_px = float(hi[e + 1:][-SMC_TOUCH_BARS:].max())
+        touched = z_bot - tol <= touch_px < start
+    print(f"[SMC {tf_name}] {name} {'BUY' if buy else 'SELL'} แท่ง {fmt(df.index[j])} | ขา {px(start):.2f}→{px(extreme):.2f} "
+          f"| โซน {px(z_bot):.2f}–{px(z_top):.2f} | ราคา {px(cur):.2f} | ชนโซน={touched}")
+    if not touched:
+        return
+    if SKIP_RISK_WINDOWS and risk:
+        return
+
+    # FVG 3 แท่งในขา (เลือกอันที่ซ้อนโซนก่อน ไม่มีก็เอาอันล่าสุด)
+    gaps = []
+    for i in range(e - 1, k, -1):
+        g_lo, g_hi = (hi[i - 1], lo[i + 1]) if buy else (hi[i + 1], lo[i - 1])
+        if g_lo < g_hi:
+            gaps.append((float(g_lo), float(g_hi)))
+    fvg = next((g for g in gaps if g[0] <= z_top and g[1] >= z_bot), gaps[0] if gaps else None)
+
+    # แท่งวิ่งแรง: ตัวแท่งตามทิศขาที่ใหญ่สุดในขา
+    bodies = [(cl[i] - op[i]) if buy else (op[i] - cl[i]) for i in range(k + 1, e + 1)]
+    max_body = max(bodies) if bodies else 0.0
+    disp = max_body >= SMC_DISP_ATR * atr_val
+
+    # OB: แท่งสวนทางล่าสุดก่อนแรงเบรก
+    ob = None
+    for i in range(j, k - 1, -1):
+        if (cl[i] < op[i]) if buy else (cl[i] > op[i]):
+            ob = (float(lo[i]), float(hi[i]))
+            break
+
+    act = "BUY" if buy else "SELL"
+    zone_txt = f"{SMC_FIB * 100:g}–{SMC_FIB_DEEP * 100:g}%"
+    sl = (start - SMC_SL_ATR * atr_val) if buy else (start + SMC_SL_ATR * atr_val)
+    if buy:
+        rr = (extreme - cur) / (cur - sl) if cur > sl else 0
+    else:
+        rr = (cur - extreme) / (sl - cur) if sl > cur else 0
+    main_ok = fvg is not None or disp
+    missing = [t for t, ok in (("FVG", fvg is not None), ("แท่งวิ่งแรง", disp), ("OB", ob is not None)) if not ok]
+
+    title = f"⚡ <b>[SMC {tf_name}] {name} {'ขาขึ้น' if buy else 'ขาลง'} + ราคาย้อนชนโซน {zone_txt} → {act} ทันที</b>"
+    lines = [
+        f"🔓 ปิด{'เหนือ LH' if buy else 'ใต้ HL'} <code>{px(ev['level']):.2f}</code> (แท่ง {fmt(df.index[j])})",
+        f"📏 ขา: {'LL' if kind == 'choch' and buy else 'HH' if kind == 'choch' else 'HL' if buy else 'LH'} <code>{px(start):.2f}</code> → "
+        f"{'จุดสูงสุด' if buy else 'จุดต่ำสุด'} <code>{px(extreme):.2f}</code> ({leg:.2f} จุด)",
+        f"🎯 โซน {zone_txt}: <code>{px(z_bot):.2f}</code> – <code>{px(z_top):.2f}</code>",
+        f"📍 ราคาย้อนชนโซนที่ <code>{px(touch_px):.2f}</code> | ราคาตอนนี้ <code>{px(cur):.2f}</code>",
+        "",
+        f"🧩 <b>เช็กลิสต์ {tf_name}</b>",
+    ]
+    if fvg:
+        ov = " (ซ้อนโซน)" if fvg[0] <= z_top and fvg[1] >= z_bot else ""
+        lines.append(f"✅ FVG 3 แท่ง: <code>{px(fvg[0]):.2f}</code> – <code>{px(fvg[1]):.2f}</code>{ov}")
+    else:
+        lines.append("❌ ไม่มี FVG 3 แท่งในขา")
+    if disp:
+        lines.append(f"✅ แท่งวิ่งแรง: ตัว {max_body / atr_val:.1f}×ATR")
+    else:
+        lines.append(f"❌ ไม่มีแท่งวิ่งแรง (แรงสุด {max_body / atr_val:.1f}×ATR < {SMC_DISP_ATR:g}×ATR)")
+    if ob:
+        ov = " (ซ้อนโซน)" if ob[0] <= z_top and ob[1] >= z_bot else ""
+        lines.append(f"✅ OB: <code>{px(ob[0]):.2f}</code> – <code>{px(ob[1]):.2f}</code>{ov}")
+    else:
+        lines.append("❌ ไม่มี OB")
+    if main_ok:
+        lines.append("✅ ผ่านเงื่อนไขหลัก (มี FVG หรือแท่งวิ่งแรง)")
+    else:
+        lines.append("⚠️ ไม่ผ่านเงื่อนไขหลัก: ไม่มีทั้ง FVG และแท่งวิ่งแรง (แจ้งตามเงื่อนไขเดิม ระวังสัญญาณคุณภาพต่ำ)")
+    if missing:
+        lines.append(f"⚠️ ขาดเงื่อนไข: {', '.join(missing)}")
+    lines += [
+        "",
+        f"🛑 SL (เลยจุดเริ่มขา +{SMC_SL_ATR:g}×ATR {atr_val:.2f}): <code>{px(sl):.2f}</code> | R:R 1:{rr:.1f}",
+        f"🏁 เป้า: <code>{px(extreme):.2f}</code>",
+        "⏳ แจ้งทันทีที่ชนโซน (ไม่รอ M1 ยืนยัน) ดูแท่งกลับตัวบนกราฟก่อนเข้า",
+    ]
+    parts = [title, f"📊 XAUUSD ({SYMBOL}) | TF {tf_name}"] + lines + risk
+    if PRICE_OFFSET:
+        parts.append(f"ℹ️ ราคาแสดงเป็นระดับ MT5 (GC=F − {PRICE_OFFSET:g})")
+    parts.append("📱 <b>เปิด MT5 เช็กกราฟก่อนตัดสินใจ</b>")
+    sent_ok = fire(f"smc:{tf_key}:{kind}_{ev['side']}", f"{df.index[j]}|{ev['level']:.2f}",
+                   "\n".join(p for p in parts if p))
+    if sent_ok:
+        try:
+            record_signal(tf_key, kind, ev["side"], cur, extreme, sl, None, None)
+        except Exception as ex:
+            print(f"Journal record error: {ex}")
+
+
+def _smc_frames(tf_name, df_4h, last_1h_start):
+    """คืน (df, closed, swing, max_age) ของแต่ละไทม์เฟรม หรือ None ถ้าข้อมูลยังไม่พร้อม"""
+    now = now_server()
+    if tf_name == "M15":
+        df = fetch_15m()
+        if df is None:
+            return None
+        live = df.index[-1] + pd.Timedelta(minutes=15) + pd.Timedelta(seconds=M15_LIVE_GRACE_SEC) > now
+        return df, (df.iloc[:-1] if live else df), M15_SWING, M15_MAX_AGE
+    if tf_name == "H4":
+        cl_i = closed_bar_index("4h", df_4h, last_1h_start)
+        if cl_i is None:
+            return None
+        return df_4h, (df_4h if cl_i == -1 else df_4h.iloc[:-1]), SMC_SWING, SMC_MAX_AGE
+    if tf_name == "D1":
+        df = fetch_d1()
+        if df is None:
+            return None
+        live = df.index[-1] + pd.Timedelta(days=1) > now
+        return df, (df.iloc[:-1] if live else df), D1_SWING, D1_MAX_AGE
+    return None
+
+
+def check_smc_unified(levels, df_4h, last_1h_start):
+    if not SMC_UNIFIED or not SMC_ALERT:
+        return
+    risk = risk_notes(levels.get("news", []))
+    for tf_name in ("M15", "H4", "D1"):
+        if tf_name not in SMC_TFS:
+            continue
+        try:
+            fr = _smc_frames(tf_name, df_4h, last_1h_start)
+            if fr is None:
+                print(f"[SMC {tf_name}] ข้อมูลยังไม่พร้อม ข้ามรอบนี้")
+                continue
+            df, closed, swing, max_age = fr
+            if len(df) < 40 or len(closed) < 40:
+                print(f"[SMC {tf_name}] ข้อมูลไม่พอ ข้ามรอบนี้")
+                continue
+            atr_val = float(calculate_atr(closed).iloc[-1])
+            if pd.isna(atr_val) or atr_val <= 0:
+                continue
+            for kind, ev in find_structure(closed, swing).items():
+                if kind == "bos" and not SMC_BOS:
+                    continue
+                if len(closed) - 1 - ev["idx"] > max_age:
+                    continue
+                _smc_alert(tf_name.lower(), tf_name, df, closed, ev, atr_val, risk)
+        except Exception as ex:
+            print(f"SMC {tf_name} error: {ex}")
+
+
 def fetch_1m():
     if not FEED_ENABLED:
         return _fetch_1m_yahoo()
@@ -2601,6 +2809,8 @@ def check_choch_retrace(df, levels, last_1h_start):
                               SMC_FIB, SMC_FIB_DEEP, SMC_MIN_LEG_ATR, SMC_MAX_AGE)
         except Exception as e:
             print(f"Early H4 error: {e}")
+        if SMC_UNIFIED:
+            continue   # H4 ใช้ระบบ SMC รวมศูนย์ (check_smc_unified) แทน
         _structure_alert(df, closed, ev, atr_val, risk)
 
 
@@ -3179,13 +3389,13 @@ def journal_lines(start_s, end_s):
     if not recs:
         return []
     out = ["", "🧪 <b>สถิติสัญญาณบอท</b> (วัดตามแผน SL/เป้าที่แจ้ง)"]
-    for sy, name in (("smc", "SMC"), ("ict", "ICT"), ("m15", "SMC M15")):
+    for sy, name in (("smc", "SMC"), ("ict", "ICT"), ("m15", "SMC M15"), ("h4", "SMC H4"), ("d1", "SMC D1")):
         rs = [r for r in recs if r["sy"] == sy]
         if not rs:
             continue
         pend = sum(1 for r in rs if _journal_pending(r))
         out.append(f"{name}: {len(rs)} สัญญาณ" + (f" (รอผล {pend})" if pend else ""))
-        if sy != "m15":   # SMC M15 ไม่มี SL แคบจาก M1
+        if sy not in ("m15", "h4", "d1"):   # SMC M15 ไม่มี SL แคบจาก M1
             out.append(_jline("SL แคบ", [(r, "rt") for r in rs if r["st"] is not None]))
         out.append(_jline("SL โครงสร้าง", [(r, "rs") for r in rs]))
         if sy == "ict":
@@ -3352,7 +3562,12 @@ def check_market():
 
     # 🆕 SMC บน M15: เกิด CHoCH/BOS แล้วราคาย้อนชนโซน 50–61.8% = แจ้งทันที
     try:
-        check_m15_retrace(levels)
+        check_smc_unified(levels, df_4h, last_1h_start)
+    except Exception as e:
+        print(f"SMC unified alert error: {e}")
+    try:
+        if not SMC_UNIFIED:
+            check_m15_retrace(levels)
     except Exception as e:
         print(f"M15 SMC alert error: {e}")
 
