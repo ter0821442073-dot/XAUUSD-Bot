@@ -10,6 +10,7 @@ import os
 import sys
 import json
 import html
+import hmac
 import time
 import threading
 from datetime import datetime, timezone, timedelta
@@ -123,17 +124,42 @@ def load_state():
         return {}
 
 
+STATE_WARN_BYTES = int(os.environ.get("STATE_WARN_BYTES", "600000"))   # Upstash ฟรีรับคำสั่งได้ราว 1MB
+_state_warned = False
+
+
 def save_state():
+    global _state_warned
     try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(sent, f)
+        raw = json.dumps(sent)
+    except Exception as e:
+        print(f"⚠️ แปลงสถานะเป็น JSON ไม่สำเร็จ: {e}")
+        return
+    size = len(raw.encode("utf-8"))
+
+    try:   # เขียนไฟล์ชั่วคราวก่อนแล้วค่อยสลับ กันไฟล์พังถ้าโปรเซสถูกฆ่ากลางเขียน
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(raw)
+        os.replace(tmp, STATE_FILE)
     except Exception as e:
         print(f"⚠️ บันทึกสถานะไม่สำเร็จ: {e}")
+
     if REMOTE_ENABLED:
         try:
-            _remote(["SET", STATE_KEY, json.dumps(sent)])
+            _remote(["SET", STATE_KEY, raw])
         except Exception as e:
-            print(f"⚠️ บันทึกสถานะลง Upstash ไม่สำเร็จ: {e}")
+            print(f"⚠️ บันทึกสถานะลง Upstash ไม่สำเร็จ ({size:,} ไบต์): {e}")
+
+    if size > STATE_WARN_BYTES:
+        if not _state_warned:
+            _state_warned = True
+            send_telegram_message(
+                f"⚠️ <b>ขนาดสถานะของบอทใหญ่ {size:,} ไบต์</b> (เกณฑ์เตือน {STATE_WARN_BYTES:,})\n"
+                f"ใกล้ขีดจำกัดของ Upstash ถ้าเกินจะบันทึกไม่สำเร็จและสถานะอาจหายตอน redeploy\n"
+                f"💡 ลด <code>LEDGER_KEEP_DAYS</code> หรือรอสรุปรายปีเพื่อเคลียร์ข้อมูลเก่า")
+    elif _state_warned and size < STATE_WARN_BYTES * 0.8:
+        _state_warned = False   # ขนาดลดลงแล้ว เตือนใหม่ได้ถ้ากลับมาโต
 
 
 sent = load_state()  # "1h:live_sell" -> id แท่งที่แจ้งแล้ว / "1h:cd_sell" -> แท่งที่เตือนทันทีล่าสุด / "ledger" -> สมุดบันทึกผลไม้
@@ -444,7 +470,8 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 self._json(413, {"ok": False, "error": "ขนาดข้อมูลไม่ถูกต้อง"})
                 return
             data = json.loads(self.rfile.read(n).decode("utf-8"))
-            if data.get("secret") != FEED_SECRET:
+            if not hmac.compare_digest(str(data.get("secret", "")).encode("utf-8"),
+                               FEED_SECRET.encode("utf-8")):
                 self._json(403, {"ok": False, "error": "secret ไม่ตรง"})
                 return
             self._json(200, feed_ingest(data))
@@ -471,18 +498,61 @@ def run_web():
 # ==========================================
 # 📨 Telegram
 # ==========================================
-def send_telegram_message(message):
+TG_CHUNK = 3800   # เผื่อไว้ใต้ขีดจำกัด 4096 ของ Telegram
+
+
+def _tg_post(text):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
-    try:
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+    r = requests.post(url, json=payload, timeout=10)
+    if r.status_code == 429:   # โดน rate limit: รอตามที่ Telegram บอกแล้วลองอีกครั้ง
+        try:
+            wait = int(r.json().get("parameters", {}).get("retry_after", 3))
+        except Exception:
+            wait = 3
+        time.sleep(min(wait, 30) + 1)
         r = requests.post(url, json=payload, timeout=10)
-        if r.status_code != 200:
-            print(f"Telegram ส่งไม่สำเร็จ [{r.status_code}]: {r.text}")
-            return False
+    return r
+
+
+def _split_message(message):
+    """ตัดตามบรรทัด ไม่ฉีกแท็ก HTML (ทุกแท็กในบอทปิดภายในบรรทัดเดียว)"""
+    chunks, cur = [], ""
+    for line in message.split("\n"):
+        while len(line) > TG_CHUNK:          # กันกรณีบรรทัดเดียวยาวเกิน
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(line[:TG_CHUNK])
+            line = line[TG_CHUNK:]
+        if len(cur) + len(line) + 1 > TG_CHUNK and cur:
+            chunks.append(cur)
+            cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        chunks.append(cur)
+    return chunks or [message]
+
+
+def send_telegram_message(message):
+    chunks = _split_message(message)
+    ok_n = 0
+    for i, ch in enumerate(chunks):
+        try:
+            r = _tg_post(ch.rstrip("\n"))
+            if r.status_code == 200:
+                ok_n += 1
+            else:
+                print(f"Telegram ส่งไม่สำเร็จ [{r.status_code}] ก้อน {i + 1}/{len(chunks)}: {r.text}")
+        except Exception as e:
+            print(f"Telegram Error ก้อน {i + 1}/{len(chunks)}: {e}")
+        if len(chunks) > 1:
+            time.sleep(0.5)
+    if ok_n and ok_n < len(chunks):
+        # ส่งไปบางส่วนแล้ว คืน True เพื่อกันบอทวนส่งซ้ำทุกรอบจนข้อความซ้ำท่วมแชต
+        print(f"⚠️ ส่งสำเร็จ {ok_n}/{len(chunks)} ก้อน (นับว่าส่งแล้ว กันส่งซ้ำ)")
         return True
-    except Exception as e:
-        print(f"Telegram Error: {e}")
-        return False
+    return ok_n == len(chunks)
 
 
 def fire(key, bar_id, msg):
@@ -1127,7 +1197,7 @@ def parse_trades(df):
         elif side_raw in ("sell", "s", "short", "ขาย"):
             side = "sell"
         else:
-            reason = f"Side '{side_raw}' ไม่รู้จัก ใช้ BUY หรือ SELL"
+            reason = f"Side '{html.escape(side_raw)}' ไม่รู้จัก ใช้ BUY หรือ SELL"
             problems.append((i + 2, reason))
             print(f"⚠️ ออเดอร์แถว {i + 2}: {reason}")
             continue
