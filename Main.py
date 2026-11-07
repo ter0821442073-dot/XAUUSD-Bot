@@ -3232,6 +3232,164 @@ def feed_time_check():
         f"ตั้ง <code>SERVER_UTC_OFFSET_HOURS={off / 3600:g}</code> ใน Render (โบรกแบบ NY close ค่านี้เปลี่ยนตาม DST ปีละ 2 ครั้ง)")
 
 
+# >>> M15C PATCH
+# ==========================================
+# 🆕 SMC M15: CHoCH + แท่งปิดกลับ -> แจ้งทันที (เตรียมเข้าโซน 50-61.8%)
+# FVG / OB ไม่บังคับ ถ้ามีจะแสดงในข้อความ
+# ==========================================
+M15C_ALERT = os.environ.get("M15C_ALERT", "1") == "1"
+M15C_BOS = os.environ.get("M15C_BOS", "0") == "1"   # 1 = รวม BOS ด้วย
+
+
+def _m15_fvg_ob(closed, j, k, e, buy):
+    """หา FVG (ในขา k..e) และ OB (แท่งสวนทางสุดท้ายก่อนแท่งเบรก j) คืน (fvg, ob) ไม่เจอเป็น None"""
+    hi, lo = closed["High"].values, closed["Low"].values
+    op, cl = closed["Open"].values, closed["Close"].values
+
+    fvg = None
+    for i in range(e - 1, k, -1):
+        if i + 1 >= len(closed):
+            continue
+        if buy:
+            g_lo, g_hi = hi[i - 1], lo[i + 1]
+        else:
+            g_lo, g_hi = hi[i + 1], lo[i - 1]
+        if g_lo >= g_hi:
+            continue
+        later = cl[i + 2:]
+        if len(later) and ((buy and later.min() < g_lo) or ((not buy) and later.max() > g_hi)):
+            continue
+        fvg = (float(g_lo), float(g_hi))
+        break
+
+    ob = None
+    for i in range(j, k - 1, -1):
+        if (cl[i] < op[i]) if buy else (cl[i] > op[i]):
+            o_lo, o_hi = float(lo[i]), float(hi[i])
+            later = cl[i + 1:]
+            if len(later) and ((buy and later.min() < o_lo) or ((not buy) and later.max() > o_hi)):
+                continue
+            ob = (o_lo, o_hi)
+            break
+    return fvg, ob
+
+
+def check_m15_choch_early(levels):
+    """M15: เกิด CHoCH -> ทำจุดสุดขอบ -> มีแท่ง M15 ปิดกลับสีสวนทาง -> ราคายังไม่เข้าโซน 50-61.8% = แจ้งทันที"""
+    if not M15C_ALERT:
+        return
+    df = fetch_15m()
+    if df is None or len(df) < 40:
+        return
+    delta = pd.Timedelta(minutes=15)
+    is_live = df.index[-1] + delta + pd.Timedelta(seconds=M15_LIVE_GRACE_SEC) > now_server()
+    closed = df.iloc[:-1] if is_live else df
+    if len(closed) < 40:
+        return
+
+    atr_val = float(calculate_atr(closed).iloc[-1])
+    if pd.isna(atr_val) or atr_val <= 0:
+        return
+    risk = risk_notes(levels.get("news", []))
+    if SKIP_RISK_WINDOWS and risk:
+        return
+
+    events = find_structure(closed, M15_SWING)
+    hi, lo = closed["High"].values, closed["Low"].values
+    op, cl = closed["Open"].values, closed["Close"].values
+    n = len(closed)
+    cur = float(df["Close"].iloc[-1])
+
+    for kind, ev in events.items():
+        if kind == "bos" and not M15C_BOS:
+            continue
+        j = ev["idx"]
+        if n - 1 - j > M15_MAX_AGE:
+            continue
+        buy, start = ev["side"] == "buy", ev["start"]
+
+        # จุดเริ่มขา k และจุดสุดขอบ e
+        a = max(0, j - 30)
+        win = lo[a:j + 1] if buy else hi[a:j + 1]
+        k = a + int(abs(win - start).argmin())
+        e = j + (int(hi[j:].argmax()) if buy else int(lo[j:].argmin()))
+        extreme = float(hi[e] if buy else lo[e])
+        leg = (extreme - start) if buy else (start - extreme)
+        if leg < M15_MIN_LEG_ATR * atr_val:
+            continue
+        if (cl[j:].min() < start) if buy else (cl[j:].max() > start):
+            continue                                        # ขาพัง
+
+        if buy:
+            z_top, z_bot = extreme - leg * M15_FIB, extreme - leg * M15_FIB_DEEP
+        else:
+            z_bot, z_top = extreme + leg * M15_FIB, extreme + leg * M15_FIB_DEEP
+
+        # ราคายังไม่เข้าโซน (แท่งหลังจุดสุดขอบรวมแท่งสด ต้องยังไม่แตะ)
+        after = df.iloc[e + 1:]
+        if len(after):
+            if buy and float(after["Low"].min()) <= z_top:
+                continue
+            if (not buy) and float(after["High"].max()) >= z_bot:
+                continue
+        dist = (cur - z_top) if buy else (z_bot - cur)
+        if dist <= 0:
+            continue
+
+        # แท่งปิดกลับ: แท่งที่ปิดล่าสุดต้องอยู่หลังจุดสุดขอบ และสีสวนทางขา (BUY=แดง / SELL=เขียว)
+        c = n - 1
+        if c <= e:
+            continue
+        if (cl[c] >= op[c]) if buy else (cl[c] <= op[c]):
+            continue
+
+        fvg, ob = _m15_fvg_ob(closed, j, k, e, buy)
+
+        act = "BUY" if buy else "SELL"
+        name = "CHoCH" if kind == "choch" else "BOS"
+        zone_txt = f"{M15_FIB * 100:g}–{M15_FIB_DEEP * 100:g}%"
+        sl = (start - M15_SL_ATR * atr_val) if buy else (start + M15_SL_ATR * atr_val)
+        z_mid = (z_top + z_bot) / 2
+        rr = (abs(extreme - z_mid) / abs(z_mid - sl)) if abs(z_mid - sl) > 0 else 0
+        s_lbl = ("LL" if kind == "choch" else "HL") if buy else ("HH" if kind == "choch" else "LH")
+        brk = ("เหนือ LH" if kind == "choch" else "เหนือ HH") if buy else ("ใต้ HL" if kind == "choch" else "ใต้ LL")
+
+        tags = [t for t, v in (("FVG", fvg), ("OB", ob)) if v]
+        tag_txt = f" + {' + '.join(tags)}" if tags else ""
+        title = (f"🔔 <b>[SMC M15] {name} {'ขาขึ้น' if buy else 'ขาลง'}{tag_txt} "
+                 f"+ แท่ง{'แดง' if buy else 'เขียว'}ปิดกลับ → เตรียมเข้าโซน {zone_txt} รอ {act}</b>")
+        lines = [
+            f"🔓 ปิด{brk} <code>{px(ev['level']):.2f}</code> (แท่ง {fmt(closed.index[j])})",
+            f"📏 ขา: {s_lbl} <code>{px(start):.2f}</code> → {'จุดสูงสุด' if buy else 'จุดต่ำสุด'} <code>{px(extreme):.2f}</code> ({leg:.2f} จุด)",
+            f"🎯 โซน {zone_txt}: <code>{px(z_bot):.2f}</code> – <code>{px(z_top):.2f}</code>",
+            f"🕯 แท่งปิดกลับ {fmt(closed.index[c])}: <code>{px(float(op[c])):.2f}</code> → <code>{px(float(cl[c])):.2f}</code>",
+            f"💵 ราคาตอนนี้: <code>{px(cur):.2f}</code> (ห่างโซน {dist:.2f} จุด / {dist / atr_val:.1f}×ATR)",
+        ]
+        if fvg:
+            ov = fvg[0] <= z_top and fvg[1] >= z_bot
+            lines.append(f"🟦 FVG: <code>{px(fvg[0]):.2f}</code> – <code>{px(fvg[1]):.2f}</code>" + (" (ซ้อนโซน)" if ov else ""))
+        else:
+            lines.append("🟦 FVG: ไม่พบ")
+        if ob:
+            ov = ob[0] <= z_top and ob[1] >= z_bot
+            lines.append(f"🟧 OB: <code>{px(ob[0]):.2f}</code> – <code>{px(ob[1]):.2f}</code>" + (" (ซ้อนโซน)" if ov else ""))
+        else:
+            lines.append("🟧 OB: ไม่พบ")
+        lines += [
+            f"🛑 SL (เลยจุดเริ่มขา +{M15_SL_ATR:g}×ATR {atr_val:.2f}): <code>{px(sl):.2f}</code> | R:R ที่กลางโซน 1:{rr:.1f}",
+            f"🏁 เป้า: <code>{px(extreme):.2f}</code>",
+            "⏳ ยังไม่เข้าโซน แจ้งล่วงหน้า รอราคาย้อนเข้าโซนแล้วดูแท่งยืนยัน",
+        ]
+        parts = [title, f"📊 XAUUSD ({SYMBOL}) | TF M15"] + lines + risk
+        if PRICE_OFFSET:
+            parts.append(f"ℹ️ ราคาแสดงเป็นระดับ MT5 (GC=F − {PRICE_OFFSET:g})")
+        parts.append(data_source_note())
+        parts.append("📱 <b>เปิด MT5 เช็กกราฟก่อนตัดสินใจ</b>")
+        fire(f"m15c:{kind}_{ev['side']}", f"{closed.index[j]}|{ev['level']:.2f}",
+             "\n".join(p for p in parts if p))
+# <<< M15C PATCH
+
+
 def check_market():
     global last_heartbeat_time, sheet_errors, data_errors, sheet_alerted, data_alerted, sheet_last_err
 
@@ -3362,6 +3520,13 @@ def check_market():
         check_m15_retrace(levels)
     except Exception as e:
         print(f"M15 SMC alert error: {e}")
+
+    # >>> M15C PATCH
+    try:
+        check_m15_choch_early(levels)
+    except Exception as e:
+        print(f"M15 CHoCH early error: {e}")
+    # <<< M15C PATCH
 
     try:
         push_removals()
