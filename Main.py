@@ -3547,6 +3547,255 @@ def watchdog():
 # ==========================================
 # 🚀 เริ่มโปรแกรม
 # ==========================================
+
+# >>> M15R PATCH
+# ลบบล็อกนี้ทั้งหมดเพื่อถอนแพทช์ (หรือรัน apply_m15_reversal_patch_v2.py --remove)
+# M15: CHoCH -> ราคาย้อนกลับมาชน แล้วมีแท่งกลับตัวปิดแล้ว = แจ้งเตือน + จด Journal
+#   - ถ้ามี FVG/OB ที่ "ต่ำกว่าโซน 50-61.8%" (SELL = สูงกว่าโซน) -> รอชน FVG/OB นั้น
+#   - ถ้าไม่มี FVG/OB ต่ำกว่าโซน -> ไม่นับ FVG/OB แล้วรอชนโซน 50-61.8% แทน
+# ปิดเฉพาะแจ้งเตือนชนโซนทันที (check_m15_retrace) / คง CHoCH+แท่งปิดกลับตัวเดิมไว้ (M15R_KEEP_EARLY=1) / ไม่บังคับเทรนด์ 4H
+
+M15R_ALERT = os.environ.get("M15R_ALERT", "1") == "1"
+M15R_BOS = os.environ.get("M15R_BOS", "0") == "1"                       # 1 = รวม BOS ด้วย
+M15R_SWING = int(os.environ.get("M15R_SWING", str(M15_SWING)))
+M15R_MIN_LEG_ATR = float(os.environ.get("M15R_MIN_LEG_ATR", str(M15_MIN_LEG_ATR)))
+M15R_MAX_AGE = int(os.environ.get("M15R_MAX_AGE", str(M15_MAX_AGE)))    # CHoCH เก่าสุดกี่แท่ง M15
+M15R_BAR_MAX_AGE_MIN = int(os.environ.get("M15R_BAR_MAX_AGE_MIN", "20"))  # แท่งกลับตัวต้องปิดไม่เกินกี่นาทีที่แล้ว
+M15R_ZONE_ALWAYS = os.environ.get("M15R_ZONE_ALWAYS", "0") == "1"       # 1 = นับโซน 50-61.8 ด้วยแม้มี FVG/OB
+M15R_ALLOW_OVERLAP = os.environ.get("M15R_ALLOW_OVERLAP", "0") == "1"   # 1 = FVG/OB ที่ซ้อนอยู่ในโซนก็นับ (ค่าเริ่มต้น 0 = ต้องต่ำกว่าโซนจริง)
+M15R_LOOSE = os.environ.get("M15R_LOOSE", "0") == "1"                   # 1 = แค่แท่งสีกลับก็นับ (ไม่ต้องกลืนกิน/ไส้ปฏิเสธ)
+M15R_KEEP_OLD_RETRACE = os.environ.get("M15R_KEEP_OLD_RETRACE", "0") == "1"   # 1 = เปิดแจ้งเตือนชนโซนแบบเดิมกลับมา
+
+M15R_KEEP_EARLY = os.environ.get("M15R_KEEP_EARLY", "1") == "1"         # 1 = คงแจ้งเตือน CHoCH + แท่งปิดกลับ (แจ้งล่วงหน้า) ตัวเดิมไว้ / 0 = ปิด
+
+_orig_check_m15_retrace = check_m15_retrace
+_orig_check_m15_choch_early = check_m15_choch_early    # ตัวเดิมก่อนแพทช์นี้ (คงไว้ใช้ต่อ)
+
+
+def check_m15_retrace(levels):
+    # ปิดแจ้งเตือนชนโซนทันทีแบบเดิม (ใช้ตัวใหม่ที่รอแท่งกลับตัวแทน)
+    if M15R_KEEP_OLD_RETRACE:
+        _orig_check_m15_retrace(levels)
+
+
+def _m15r_areas(closed, j, k, e, buy, z_bot, z_top, tol):
+    # หา FVG / OB ในขา เฉพาะที่อยู่ต่ำกว่าโซน (BUY) หรือสูงกว่าโซน (SELL) และยังไม่ถูกปิดทะลุ
+    # คืน (fvg, ob) แต่ละตัวเป็น (low, high) หรือ None เลือกอันที่ใกล้โซนที่สุด (ราคาจะไปชนก่อน)
+    hi, lo = closed["High"].values, closed["Low"].values
+    op, cl = closed["Open"].values, closed["Close"].values
+    n = len(closed)
+
+    def deep(a_lo, a_hi):
+        if buy:
+            return a_hi <= (z_top if M15R_ALLOW_OVERLAP else z_bot) + tol
+        return a_lo >= (z_bot if M15R_ALLOW_OVERLAP else z_top) - tol
+
+    fvgs = []
+    for i in range(max(k + 1, 1), min(e, n - 1)):
+        if buy:
+            g_lo, g_hi = float(hi[i - 1]), float(lo[i + 1])
+        else:
+            g_lo, g_hi = float(hi[i + 1]), float(lo[i - 1])
+        if g_lo >= g_hi:
+            continue
+        later = cl[i + 2:]
+        if len(later) and ((buy and later.min() < g_lo) or ((not buy) and later.max() > g_hi)):
+            continue
+        if deep(g_lo, g_hi):
+            fvgs.append((g_lo, g_hi))
+
+    obs = []
+    for i in range(k, j + 1):
+        if not ((cl[i] < op[i]) if buy else (cl[i] > op[i])):
+            continue
+        o_lo, o_hi = float(lo[i]), float(hi[i])
+        later = cl[i + 1:]
+        if len(later) and ((buy and later.min() < o_lo) or ((not buy) and later.max() > o_hi)):
+            continue
+        if deep(o_lo, o_hi):
+            obs.append((o_lo, o_hi))
+
+    if buy:
+        fvg = max(fvgs, key=lambda g: g[1]) if fvgs else None
+        ob = max(obs, key=lambda g: g[1]) if obs else None
+    else:
+        fvg = min(fvgs, key=lambda g: g[0]) if fvgs else None
+        ob = min(obs, key=lambda g: g[0]) if obs else None
+    return fvg, ob
+
+
+def check_m15_choch_early(levels):
+    # check_market เรียกชื่อนี้อยู่: รันแจ้งเตือน CHoCH + แท่งปิดกลับตัวเดิม (ถ้าเปิด) แล้วตามด้วยตัวใหม่
+    if M15R_KEEP_EARLY:
+        try:
+            _orig_check_m15_choch_early(levels)
+        except Exception as ex:
+            print(f"M15 early (เดิม) error: {ex}")
+    if not M15R_ALERT:
+        return
+    df = fetch_15m()
+    if df is None or len(df) < 40:
+        return
+    delta = pd.Timedelta(minutes=15)
+    now = now_server()
+    is_live = df.index[-1] + delta + pd.Timedelta(seconds=M15_LIVE_GRACE_SEC) > now
+    closed = df.iloc[:-1] if is_live else df
+    if len(closed) < 40:
+        return
+
+    atr_val = float(calculate_atr(closed).iloc[-1])
+    if pd.isna(atr_val) or atr_val <= 0:
+        return
+    risk = risk_notes(levels.get("news", []))
+    if SKIP_RISK_WINDOWS and risk:
+        return
+
+    c = len(closed) - 1
+    if now - (closed.index[c] + delta) > pd.Timedelta(minutes=M15R_BAR_MAX_AGE_MIN):
+        return
+    hi, lo = closed["High"].values, closed["Low"].values
+    op, cl = closed["Open"].values, closed["Close"].values
+    tol = M15_TOL_ATR * atr_val
+
+    events = find_structure(closed, M15R_SWING)
+    for kind, ev in events.items():
+        if kind == "bos" and not M15R_BOS:
+            continue
+        j = ev["idx"]
+        if c - j > M15R_MAX_AGE:
+            continue
+        buy, start = ev["side"] == "buy", ev["start"]
+        side = ev["side"]
+
+        a = max(0, j - 30)
+        win = lo[a:j + 1] if buy else hi[a:j + 1]
+        k = a + int(abs(win - start).argmin())
+        e = j + (int(hi[j:].argmax()) if buy else int(lo[j:].argmin()))
+        if c <= e:
+            continue                                         # แท่งกลับตัวต้องอยู่หลังจุดสุดขอบ
+        extreme = float(hi[e] if buy else lo[e])
+        leg = (extreme - start) if buy else (start - extreme)
+        if leg < M15R_MIN_LEG_ATR * atr_val:
+            continue
+        if (cl[j:].min() < start) if buy else (cl[j:].max() > start):
+            continue                                         # ขาพัง
+
+        if buy:
+            z_top, z_bot = extreme - leg * M15_FIB, extreme - leg * M15_FIB_DEEP
+        else:
+            z_bot, z_top = extreme + leg * M15_FIB, extreme + leg * M15_FIB_DEEP
+
+        fvg, ob = _m15r_areas(closed, j, k, e, buy, z_bot, z_top, tol)
+        areas = []
+        if fvg:
+            areas.append(("fvg", fvg[0], fvg[1]))
+        if ob:
+            areas.append(("ob", ob[0], ob[1]))
+        if not areas or M15R_ZONE_ALWAYS:
+            areas.append(("zone", z_bot, z_top))
+
+        pat = reversal_pattern("buy" if buy else "sell", float(op[c - 1]), float(cl[c - 1]),
+                               float(op[c]), float(hi[c]), float(lo[c]), float(cl[c]))
+        if pat is None and M15R_LOOSE and ((cl[c] > op[c]) if buy else (cl[c] < op[c])):
+            pat = "แท่งกลับสี"
+
+        names = "+".join(x[0] for x in areas)
+        print(f"[M15R] {kind} {side} แท่ง {fmt(closed.index[j])} | โซน {px(z_bot):.2f}-{px(z_top):.2f} | "
+              f"รอชน: {names} | แท่งกลับตัว={pat}")
+        if pat is None:
+            continue
+
+        touched = []
+        for nm, a_lo, a_hi in areas:
+            if buy:
+                ok = min(lo[c], lo[c - 1]) <= a_hi and cl[c] >= a_lo - tol and cl[c] > start
+            else:
+                ok = max(hi[c], hi[c - 1]) >= a_lo and cl[c] <= a_hi + tol and cl[c] < start
+            if ok:
+                touched.append(nm)
+        if not touched:
+            continue
+
+        entry = float(cl[c])
+        sl = (start - M15_SL_ATR * atr_val) if buy else (start + M15_SL_ATR * atr_val)
+        if (buy and not (sl < entry < extreme)) or ((not buy) and not (extreme < entry < sl)):
+            continue
+        rr = abs(extreme - entry) / abs(entry - sl)
+
+        label = "+".join(touched)
+        name = "CHoCH" if kind == "choch" else "BOS"
+        act = "BUY" if buy else "SELL"
+        zone_txt = f"{M15_FIB * 100:g}–{M15_FIB_DEEP * 100:g}%"
+        nm_th = {"fvg": "FVG", "ob": "OB", "zone": f"โซน {zone_txt}"}
+        hit_txt = " + ".join(nm_th[x] for x in touched)
+        below = "ต่ำกว่า" if buy else "สูงกว่า"
+        s_lbl = ("LL" if kind == "choch" else "HL") if buy else ("HH" if kind == "choch" else "LH")
+        brk = ("เหนือ LH" if kind == "choch" else "เหนือ HH") if buy else ("ใต้ HL" if kind == "choch" else "ใต้ LL")
+
+        title = (f"🔔 <b>[SMC M15] {name} {'ขาขึ้น' if buy else 'ขาลง'} + ย้อนชน {hit_txt} "
+                 f"+ แท่งกลับตัว → {act}</b>")
+        lines = [
+            f"🔓 ปิด{brk} <code>{px(ev['level']):.2f}</code> (แท่ง M15 {fmt(closed.index[j])})",
+            f"📏 ขา: {s_lbl} <code>{px(start):.2f}</code> → {'จุดสูงสุด' if buy else 'จุดต่ำสุด'} <code>{px(extreme):.2f}</code> ({leg:.2f} จุด)",
+            f"🎯 โซน {zone_txt}: <code>{px(z_bot):.2f}</code> – <code>{px(z_top):.2f}</code>",
+        ]
+        if fvg:
+            lines.append(f"🟦 FVG ({below}โซน): <code>{px(fvg[0]):.2f}</code> – <code>{px(fvg[1]):.2f}</code>" + (" ✅ ชนแล้ว" if "fvg" in touched else ""))
+        else:
+            lines.append(f"🟦 FVG {below}โซน: ไม่พบ")
+        if ob:
+            lines.append(f"🟧 OB ({below}โซน): <code>{px(ob[0]):.2f}</code> – <code>{px(ob[1]):.2f}</code>" + (" ✅ ชนแล้ว" if "ob" in touched else ""))
+        else:
+            lines.append(f"🟧 OB {below}โซน: ไม่พบ")
+        if "zone" in touched:
+            lines.append("ℹ️ ไม่มี FVG/OB ต่ำกว่าโซน จึงใช้โซน 50–61.8% เป็นจุดเข้า" if (not fvg and not ob)
+                         else "ℹ️ แท่งชนโซน 50–61.8% ด้วย")
+        lines += [
+            f"🕯 แท่งกลับตัว {fmt(closed.index[c])} ({pat}): <code>{px(float(op[c])):.2f}</code> → <code>{px(entry):.2f}</code>",
+            f"💵 เข้า (ราคาปิดแท่งกลับตัว): <code>{px(entry):.2f}</code>",
+            f"🛑 SL (เลยจุดเริ่มขา +{M15_SL_ATR:g}×ATR {atr_val:.2f}): <code>{px(sl):.2f}</code> | R:R 1:{rr:.1f}",
+            f"🏁 เป้า: <code>{px(extreme):.2f}</code>",
+        ]
+        parts = [title, f"📊 XAUUSD ({SYMBOL}) | TF M15"] + lines + risk
+        if PRICE_OFFSET:
+            parts.append(f"ℹ️ ราคาแสดงเป็นระดับ MT5 (GC=F − {PRICE_OFFSET:g})")
+        parts.append(data_source_note())
+        parts.append("📱 <b>เปิด MT5 เช็กกราฟก่อนตัดสินใจ</b>")
+
+        # แจ้งครั้งเดียวต่อ CHoCH 1 เหตุการณ์
+        if fire(f"m15r:{kind}_{side}", f"{closed.index[j]}|{ev['level']:.2f}",
+                "\n".join(p for p in parts if p)):
+            try:
+                record_signal("m15r", f"{kind}_{label}", side, entry, extreme, sl, None, None)
+            except Exception as ex:
+                print(f"Journal record error: {ex}")
+
+
+# ---------- สถิติท้ายสรุป: เติมส่วน M15 ย้อนชน+แท่งกลับตัว (แยกตาม FVG / OB / โซน) ----------
+_orig_journal_lines_m15r = journal_lines
+
+
+def journal_lines(start_s, end_s):
+    out = list(_orig_journal_lines_m15r(start_s, end_s))
+    rs = [r for r in sent.get("journal", {}).values()
+          if r["sy"] == "m15r" and start_s < pd.Timestamp(r["t"]) <= end_s]
+    if not rs:
+        return out
+    if not out:
+        out = ["", "🧪 <b>สถิติสัญญาณบอท</b> (วัดตามแผน SL/เป้าที่แจ้ง)"]
+    pend = sum(1 for r in rs if _journal_pending(r))
+    out.append(f"SMC M15 CHoCH ย้อนชน + แท่งกลับตัว: {len(rs)} สัญญาณ" + (f" (รอผล {pend})" if pend else ""))
+    out.append(_jline("รวม", [(r, "rs") for r in rs]))
+    for lab, nm in (("fvg", "ชน FVG (ต่ำกว่าโซน)"), ("ob", "ชน OB (ต่ำกว่าโซน)"),
+                    ("fvg+ob", "ชน FVG+OB พร้อมกัน"),
+                    ("zone", "ชนโซน 50–61.8% (ไม่มี FVG/OB ต่ำกว่าโซน)")):
+        sub = [r for r in rs if r["k"].split("_", 1)[-1] == lab]
+        if sub:
+            out.append(_jline(nm, [(r, "rs") for r in sub]))
+    return out
+# <<< M15R PATCH
+
+
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
