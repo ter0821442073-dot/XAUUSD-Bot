@@ -2683,6 +2683,9 @@ def check_m15_retrace(levels):
         return
 
     events = find_structure(closed, M15_SWING)
+    if events:   # M15LATEST
+        _lt = max(events.values(), key=lambda x: x["idx"])   # M15LATEST
+        events = {_lt["kind"]: _lt}   # M15LATEST
     atr_val = float(calculate_atr(closed).iloc[-1])
     if pd.isna(atr_val) or atr_val <= 0:
         return
@@ -3295,6 +3298,9 @@ def check_m15_choch_early(levels):
         return
 
     events = find_structure(closed, M15_SWING)
+    if events:   # M15LATEST
+        _lt = max(events.values(), key=lambda x: x["idx"])   # M15LATEST
+        events = {_lt["kind"]: _lt}   # M15LATEST
     hi, lo = closed["High"].values, closed["Low"].values
     op, cl = closed["Open"].values, closed["Close"].values
     n = len(closed)
@@ -3669,6 +3675,9 @@ def check_m15_choch_early(levels):
     tol = M15_TOL_ATR * atr_val
 
     events = find_structure(closed, M15R_SWING)
+    if events:   # M15LATEST
+        _lt = max(events.values(), key=lambda x: x["idx"])   # M15LATEST
+        events = {_lt["kind"]: _lt}   # M15LATEST
     for kind, ev in events.items():
         if kind == "bos" and not M15R_BOS:
             continue
