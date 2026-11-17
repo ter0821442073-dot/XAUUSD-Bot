@@ -3308,6 +3308,11 @@ def check_m15_choch_early(levels):
             continue
         buy, start = ev["side"] == "buy", ev["start"]
 
+        eid = f"{closed.index[j]}|{ev['level']:.2f}"   # M15FIX
+        tkey = f"m15c_touch:{kind}_{ev['side']}"   # M15FIX
+        if sent.get(f"m15r:{kind}_{ev['side']}") == eid or sent.get(tkey) == eid:   # M15FIX
+            continue   # CHoCH ตัวนี้ชนโซนไปแล้ว/แจ้งตอนชนไปแล้ว ไม่ต้องแจ้งล่วงหน้าอีก   # M15FIX
+
         # จุดเริ่มขา k และจุดสุดขอบ e
         a = max(0, j - 30)
         win = lo[a:j + 1] if buy else hi[a:j + 1]
@@ -3327,14 +3332,20 @@ def check_m15_choch_early(levels):
 
         # ราคายังไม่เข้าโซน (แท่งหลังจุดสุดขอบรวมแท่งสด ต้องยังไม่แตะ)
         after = df.iloc[e + 1:]
+        entered = False   # M15FIX
         if len(after):
             if buy and float(after["Low"].min()) <= z_top:
-                continue
+                entered = True
             if (not buy) and float(after["High"].max()) >= z_bot:
-                continue
+                entered = True
         dist = (cur - z_top) if buy else (z_bot - cur)
         if dist <= 0:
-            continue
+            entered = True
+        if entered:   # M15FIX
+            if sent.get(tkey) != eid:   # จำไว้ว่าชนแล้ว แม้จุดสุดขอบจะเลื่อนทีหลัง   # M15FIX
+                sent[tkey] = eid   # M15FIX
+                save_state()   # M15FIX
+            continue   # M15FIX
 
         # แท่งปิดกลับ: แท่งที่ปิดล่าสุดต้องอยู่หลังจุดสุดขอบ และสีสวนทางขา (BUY=แดง / SELL=เขียว)
         c = n - 1
