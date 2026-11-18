@@ -3314,9 +3314,9 @@ def check_m15_choch_early(levels):
             continue
         buy, start = ev["side"] == "buy", ev["start"]
 
-        eid = f"{closed.index[j]}|{ev['level']:.2f}"   # M15FIX
+        eid = f"{closed.index[j]}"   # M15FIX # M15DEDUPE
         tkey = f"m15c_touch:{kind}_{ev['side']}"   # M15FIX
-        if sent.get(f"m15r:{kind}_{ev['side']}") == eid or sent.get(tkey) == eid:   # M15FIX
+        if any(str(sent.get(k, "")).split("|")[0] == eid for k in (f"m15r:{kind}_{ev['side']}", f"m15c:{kind}_{ev['side']}", tkey)):   # M15FIX # M15DEDUPE
             continue   # CHoCH ตัวนี้ชนโซนไปแล้ว/แจ้งตอนชนไปแล้ว ไม่ต้องแจ้งล่วงหน้าอีก   # M15FIX
 
         # จุดเริ่มขา k และจุดสุดขอบ e
@@ -3402,7 +3402,7 @@ def check_m15_choch_early(levels):
             parts.append(f"ℹ️ ราคาแสดงเป็นระดับ MT5 (GC=F − {PRICE_OFFSET:g})")
         parts.append(data_source_note())
         parts.append("📱 <b>เปิด MT5 เช็กกราฟก่อนตัดสินใจ</b>")
-        fire(f"m15c:{kind}_{ev['side']}", f"{closed.index[j]}|{ev['level']:.2f}",
+        fire(f"m15c:{kind}_{ev['side']}", f"{closed.index[j]}",   # M15DEDUPE
              "\n".join(p for p in parts if p))
 # <<< M15C PATCH
 
@@ -3783,7 +3783,9 @@ def check_m15_choch_early(levels):
         parts.append("📱 <b>เปิด MT5 เช็กกราฟก่อนตัดสินใจ</b>")
 
         # แจ้งครั้งเดียวต่อ CHoCH 1 เหตุการณ์
-        if fire(f"m15r:{kind}_{side}", f"{closed.index[j]}|{ev['level']:.2f}",
+        if str(sent.get(f"m15r:{kind}_{side}", "")).split("|")[0] == f"{closed.index[j]}":   # M15DEDUPE
+            continue   # M15DEDUPE
+        if fire(f"m15r:{kind}_{side}", f"{closed.index[j]}",   # M15DEDUPE
                 "\n".join(p for p in parts if p)):
             try:
                 record_signal("m15r", f"{kind}_{label}", side, entry, extreme, sl, None, None)
@@ -3814,6 +3816,313 @@ def journal_lines(start_s, end_s):
             out.append(_jline(nm, [(r, "rs") for r in sub]))
     return out
 # <<< M15R PATCH
+
+
+# >>> H4R PATCH
+# 4H CHoCH แบบเดียวกับ M15
+#  1) แจ้งล่วงหน้า: CHoCH + แท่ง 4H ปิดกลับสีสวนทาง และราคายังไม่เข้าโซน 50-61.8%
+#  2) แจ้งตอนย้อนชน: ชน FVG/OB ต่ำกว่าโซน (ถ้าไม่มี = ชนโซน 50-61.8%) + แท่ง 4H กลับตัว (กลืนกิน/ไส้ปฏิเสธ)
+# ไม่บังคับ FVG+OB ไม่ต้องรอ M1 / BOS ไม่แจ้ง (H4R_BOS=0)
+H4R_ALERT = os.environ.get("H4R_ALERT", "1") == "1"
+H4R_EARLY = os.environ.get("H4R_EARLY", "1") == "1"                      # 0 = ปิดแจ้งล่วงหน้า
+H4R_BOS = os.environ.get("H4R_BOS", "0") == "1"
+H4R_SWING = int(os.environ.get("H4R_SWING", str(SMC_SWING)))
+H4R_MIN_LEG_ATR = float(os.environ.get("H4R_MIN_LEG_ATR", str(SMC_MIN_LEG_ATR)))
+H4R_MAX_AGE = int(os.environ.get("H4R_MAX_AGE", str(SMC_MAX_AGE)))        # CHoCH เก่าสุดกี่แท่ง 4H
+H4R_BAR_MAX_AGE_MIN = int(os.environ.get("H4R_BAR_MAX_AGE_MIN", "90"))    # แท่งกลับตัวต้องปิดไม่เกินกี่นาทีที่แล้ว
+H4R_ZONE_ALWAYS = os.environ.get("H4R_ZONE_ALWAYS", "0") == "1"           # 1 = นับโซน 50-61.8 ด้วยแม้มี FVG/OB
+H4R_LOOSE = os.environ.get("H4R_LOOSE", "0") == "1"                       # 1 = แค่แท่งสีกลับก็นับ (ไม่ต้องกลืนกิน/ไส้ปฏิเสธ)
+H4R_KEEP_OLD = os.environ.get("H4R_KEEP_OLD", "0") == "1"                 # 1 = เปิด SMC 4H ตัวเดิมคู่กัน
+_orig_check_choch_retrace = check_choch_retrace
+
+
+def _h4r_contexts(df, last_1h_start):
+    cl_i = closed_bar_index("4h", df, last_1h_start)
+    if cl_i is None:
+        return None
+    closed = df if cl_i == -1 else df.iloc[:-1]
+    if len(closed) < 40:
+        return None
+    atr_val = float(calculate_atr(closed).iloc[-1])
+    if pd.isna(atr_val) or atr_val <= 0:
+        return None
+
+    events = find_structure(closed, H4R_SWING)
+    if events:   # ใช้เฉพาะเหตุการณ์ล่าสุด (ถ้ามี BOS ใหม่กว่า CHoCH เดิมจะถูกทิ้ง)
+        lt = max(events.values(), key=lambda x: x["idx"])
+        events = {lt["kind"]: lt}
+
+    hi, lo, cl = closed["High"].values, closed["Low"].values, closed["Close"].values
+    c = len(closed) - 1
+    out = []
+    for kind, ev in events.items():
+        if kind == "bos" and not H4R_BOS:
+            continue
+        j = ev["idx"]
+        tag = f"[H4R] {kind} {ev['side']} {fmt(closed.index[j])}"
+        if c - j > H4R_MAX_AGE:
+            print(f"{tag}: เก่าเกิน {H4R_MAX_AGE} แท่ง ข้าม")
+            continue
+        buy, start = ev["side"] == "buy", ev["start"]
+        a = max(0, j - 30)
+        win = lo[a:j + 1] if buy else hi[a:j + 1]
+        k = a + int(abs(win - start).argmin())
+        e = j + (int(hi[j:].argmax()) if buy else int(lo[j:].argmin()))
+        if c <= e:
+            print(f"{tag}: แท่งล่าสุดคือจุดสุดขอบ ยังไม่มีแท่งกลับตัว")
+            continue
+        extreme = float(hi[e] if buy else lo[e])
+        leg = (extreme - start) if buy else (start - extreme)
+        if leg < H4R_MIN_LEG_ATR * atr_val:
+            print(f"{tag}: ขาสั้น {leg:.2f} < {H4R_MIN_LEG_ATR:g}xATR ข้าม")
+            continue
+        if (cl[j:].min() < start) if buy else (cl[j:].max() > start):
+            print(f"{tag}: ขาพัง ข้าม")
+            continue
+        if buy:
+            z_top, z_bot = extreme - leg * SMC_FIB, extreme - leg * SMC_FIB_DEEP
+        else:
+            z_bot, z_top = extreme + leg * SMC_FIB, extreme + leg * SMC_FIB_DEEP
+        out.append({"kind": kind, "ev": ev, "side": ev["side"], "buy": buy, "start": start,
+                    "j": j, "k": k, "e": e, "extreme": extreme, "leg": leg,
+                    "z_bot": z_bot, "z_top": z_top, "eid": str(closed.index[j])})
+    return closed, atr_val, out
+
+
+def _h4r_tail(risk):
+    parts = list(risk)
+    if PRICE_OFFSET:
+        parts.append(f"ℹ️ ราคาแสดงเป็นระดับ MT5 (GC=F − {PRICE_OFFSET:g})")
+    parts.append(data_source_note())
+    parts.append("📱 <b>เปิด MT5 เช็กกราฟก่อนตัดสินใจ</b>")
+    return parts
+
+
+def _h4r_labels(kind, buy):
+    s_lbl = ("LL" if kind == "choch" else "HL") if buy else ("HH" if kind == "choch" else "LH")
+    brk = ("เหนือ LH" if kind == "choch" else "เหนือ HH") if buy else ("ใต้ HL" if kind == "choch" else "ใต้ LL")
+    return s_lbl, brk
+
+
+def _h4r_retrace(df, levels, last_1h_start):
+    r = _h4r_contexts(df, last_1h_start)
+    if r is None:
+        return
+    closed, atr_val, ctxs = r
+    if not ctxs:
+        return
+    delta = pd.Timedelta(hours=4)
+    c = len(closed) - 1
+    if now_server() - (closed.index[c] + delta) > pd.Timedelta(minutes=H4R_BAR_MAX_AGE_MIN):
+        return
+    risk = risk_notes(levels.get("news", []))
+    if SKIP_RISK_WINDOWS and risk:
+        return
+    hi, lo = closed["High"].values, closed["Low"].values
+    op, cl = closed["Open"].values, closed["Close"].values
+    tol = SMC_TOL_ATR * atr_val
+
+    for x in ctxs:
+        kind, ev, side, buy = x["kind"], x["ev"], x["side"], x["buy"]
+        start, j, k, e = x["start"], x["j"], x["k"], x["e"]
+        extreme, leg, z_bot, z_top, eid = x["extreme"], x["leg"], x["z_bot"], x["z_top"], x["eid"]
+        if sent.get(f"h4r:{kind}_{side}") == eid:
+            continue
+
+        fvg, ob = _m15r_areas(closed, j, k, e, buy, z_bot, z_top, tol)
+        areas = []
+        if fvg:
+            areas.append(("fvg", fvg[0], fvg[1]))
+        if ob:
+            areas.append(("ob", ob[0], ob[1]))
+        if not areas or H4R_ZONE_ALWAYS:
+            areas.append(("zone", z_bot, z_top))
+
+        pat = reversal_pattern("buy" if buy else "sell", float(op[c - 1]), float(cl[c - 1]),
+                               float(op[c]), float(hi[c]), float(lo[c]), float(cl[c]))
+        if pat is None and H4R_LOOSE and ((cl[c] > op[c]) if buy else (cl[c] < op[c])):
+            pat = "แท่งกลับสี"
+        print(f"[H4R] {kind} {side} {fmt(closed.index[j])} | โซน {px(z_bot):.2f}-{px(z_top):.2f} | "
+              f"รอชน: {'+'.join(a[0] for a in areas)} | แท่งกลับตัว={pat}")
+        if pat is None:
+            continue
+
+        touched = []
+        for nm, a_lo, a_hi in areas:
+            if buy:
+                ok = min(lo[c], lo[c - 1]) <= a_hi and cl[c] >= a_lo - tol and cl[c] > start
+            else:
+                ok = max(hi[c], hi[c - 1]) >= a_lo and cl[c] <= a_hi + tol and cl[c] < start
+            if ok:
+                touched.append(nm)
+        if not touched:
+            continue
+
+        entry = float(cl[c])
+        sl = (start - SMC_SL_ATR * atr_val) if buy else (start + SMC_SL_ATR * atr_val)
+        if (buy and not (sl < entry < extreme)) or ((not buy) and not (extreme < entry < sl)):
+            continue
+        rr = abs(extreme - entry) / abs(entry - sl)
+
+        name = "CHoCH" if kind == "choch" else "BOS"
+        act = "BUY" if buy else "SELL"
+        zone_txt = f"{SMC_FIB * 100:g}–{SMC_FIB_DEEP * 100:g}%"
+        nm_th = {"fvg": "FVG", "ob": "OB", "zone": f"โซน {zone_txt}"}
+        hit_txt = " + ".join(nm_th[t] for t in touched)
+        below = "ต่ำกว่า" if buy else "สูงกว่า"
+        s_lbl, brk = _h4r_labels(kind, buy)
+
+        title = (f"🔔 <b>[SMC 4H] {name} {'ขาขึ้น' if buy else 'ขาลง'} + ย้อนชน {hit_txt} "
+                 f"+ แท่งกลับตัว → {act}</b>")
+        lines = [
+            f"🔓 ปิด{brk} <code>{px(ev['level']):.2f}</code> (แท่ง 4H {fmt(closed.index[j])})",
+            f"📏 ขา: {s_lbl} <code>{px(start):.2f}</code> → {'จุดสูงสุด' if buy else 'จุดต่ำสุด'} <code>{px(extreme):.2f}</code> ({leg:.2f} จุด)",
+            f"🎯 โซน {zone_txt}: <code>{px(z_bot):.2f}</code> – <code>{px(z_top):.2f}</code>",
+        ]
+        if fvg:
+            lines.append(f"🟦 FVG ({below}โซน): <code>{px(fvg[0]):.2f}</code> – <code>{px(fvg[1]):.2f}</code>" + (" ✅ ชนแล้ว" if "fvg" in touched else ""))
+        else:
+            lines.append(f"🟦 FVG {below}โซน: ไม่พบ")
+        if ob:
+            lines.append(f"🟧 OB ({below}โซน): <code>{px(ob[0]):.2f}</code> – <code>{px(ob[1]):.2f}</code>" + (" ✅ ชนแล้ว" if "ob" in touched else ""))
+        else:
+            lines.append(f"🟧 OB {below}โซน: ไม่พบ")
+        if "zone" in touched:
+            lines.append("ℹ️ ไม่มี FVG/OB ต่ำกว่าโซน จึงใช้โซน 50–61.8% เป็นจุดเข้า" if (not fvg and not ob)
+                         else "ℹ️ แท่งชนโซน 50–61.8% ด้วย")
+        lines += [
+            f"🕯 แท่งกลับตัว {fmt(closed.index[c])} ({pat}): <code>{px(float(op[c])):.2f}</code> → <code>{px(entry):.2f}</code>",
+            f"💵 เข้า (ราคาปิดแท่งกลับตัว): <code>{px(entry):.2f}</code>",
+            f"🛑 SL (เลยจุดเริ่มขา +{SMC_SL_ATR:g}×ATR {atr_val:.2f}): <code>{px(sl):.2f}</code> | R:R 1:{rr:.1f}",
+            f"🏁 เป้า: <code>{px(extreme):.2f}</code>",
+        ]
+        parts = [title, f"📊 XAUUSD ({SYMBOL}) | TF 4H"] + lines + _h4r_tail(risk)
+        if fire(f"h4r:{kind}_{side}", eid, "\n".join(p for p in parts if p)):
+            try:
+                record_signal("h4r", f"{kind}_{'+'.join(touched)}", side, entry, extreme, sl, None, None)
+            except Exception as ex:
+                print(f"Journal record error: {ex}")
+
+
+def _h4r_early(df, levels, last_1h_start):
+    if not H4R_EARLY:
+        return
+    r = _h4r_contexts(df, last_1h_start)
+    if r is None:
+        return
+    closed, atr_val, ctxs = r
+    if not ctxs:
+        return
+    delta = pd.Timedelta(hours=4)
+    c = len(closed) - 1
+    if now_server() - (closed.index[c] + delta) > pd.Timedelta(minutes=H4R_BAR_MAX_AGE_MIN):
+        return
+    risk = risk_notes(levels.get("news", []))
+    if SKIP_RISK_WINDOWS and risk:
+        return
+    op, cl = closed["Open"].values, closed["Close"].values
+    cur = float(df["Close"].iloc[-1])
+
+    for x in ctxs:
+        kind, ev, side, buy = x["kind"], x["ev"], x["side"], x["buy"]
+        start, j, k, e = x["start"], x["j"], x["k"], x["e"]
+        extreme, leg, z_bot, z_top, eid = x["extreme"], x["leg"], x["z_bot"], x["z_top"], x["eid"]
+        tkey = f"h4c_touch:{kind}_{side}"
+        if sent.get(f"h4r:{kind}_{side}") == eid or sent.get(f"h4c:{kind}_{side}") == eid or sent.get(tkey) == eid:
+            continue   # แจ้งไปแล้ว / ชนโซนไปแล้ว
+
+        after = df.iloc[e + 1:]
+        entered = False
+        if len(after):
+            if buy and float(after["Low"].min()) <= z_top:
+                entered = True
+            if (not buy) and float(after["High"].max()) >= z_bot:
+                entered = True
+        dist = (cur - z_top) if buy else (z_bot - cur)
+        if dist <= 0:
+            entered = True
+        if entered:
+            sent[tkey] = eid   # จำไว้ว่าชนโซนแล้ว กันแจ้งล่วงหน้าย้อนหลัง
+            save_state()
+            continue
+
+        if (cl[c] >= op[c]) if buy else (cl[c] <= op[c]):
+            continue   # แท่งปิดล่าสุดต้องสีสวนทางขา (BUY=แดง / SELL=เขียว)
+
+        fvg, ob = _m15_fvg_ob(closed, j, k, e, buy)
+        name = "CHoCH" if kind == "choch" else "BOS"
+        act = "BUY" if buy else "SELL"
+        zone_txt = f"{SMC_FIB * 100:g}–{SMC_FIB_DEEP * 100:g}%"
+        sl = (start - SMC_SL_ATR * atr_val) if buy else (start + SMC_SL_ATR * atr_val)
+        z_mid = (z_top + z_bot) / 2
+        rr = (abs(extreme - z_mid) / abs(z_mid - sl)) if abs(z_mid - sl) > 0 else 0
+        s_lbl, brk = _h4r_labels(kind, buy)
+        tags = [t for t, v in (("FVG", fvg), ("OB", ob)) if v]
+        tag_txt = f" + {' + '.join(tags)}" if tags else ""
+        title = (f"🔔 <b>[SMC 4H] {name} {'ขาขึ้น' if buy else 'ขาลง'}{tag_txt} "
+                 f"+ แท่ง{'แดง' if buy else 'เขียว'}ปิดกลับ → เตรียมเข้าโซน {zone_txt} รอ {act}</b>")
+        lines = [
+            f"🔓 ปิด{brk} <code>{px(ev['level']):.2f}</code> (แท่ง 4H {fmt(closed.index[j])})",
+            f"📏 ขา: {s_lbl} <code>{px(start):.2f}</code> → {'จุดสูงสุด' if buy else 'จุดต่ำสุด'} <code>{px(extreme):.2f}</code> ({leg:.2f} จุด)",
+            f"🎯 โซน {zone_txt}: <code>{px(z_bot):.2f}</code> – <code>{px(z_top):.2f}</code>",
+            f"🕯 แท่งปิดกลับ {fmt(closed.index[c])}: <code>{px(float(op[c])):.2f}</code> → <code>{px(float(cl[c])):.2f}</code>",
+            f"💵 ราคาตอนนี้: <code>{px(cur):.2f}</code> (ห่างโซน {dist:.2f} จุด / {dist / atr_val:.1f}×ATR)",
+        ]
+        if fvg:
+            ov = fvg[0] <= z_top and fvg[1] >= z_bot
+            lines.append(f"🟦 FVG: <code>{px(fvg[0]):.2f}</code> – <code>{px(fvg[1]):.2f}</code>" + (" (ซ้อนโซน)" if ov else ""))
+        else:
+            lines.append("🟦 FVG: ไม่พบ")
+        if ob:
+            ov = ob[0] <= z_top and ob[1] >= z_bot
+            lines.append(f"🟧 OB: <code>{px(ob[0]):.2f}</code> – <code>{px(ob[1]):.2f}</code>" + (" (ซ้อนโซน)" if ov else ""))
+        else:
+            lines.append("🟧 OB: ไม่พบ")
+        lines += [
+            f"🛑 SL (เลยจุดเริ่มขา +{SMC_SL_ATR:g}×ATR {atr_val:.2f}): <code>{px(sl):.2f}</code> | R:R ที่กลางโซน 1:{rr:.1f}",
+            f"🏁 เป้า: <code>{px(extreme):.2f}</code>",
+            "⏳ ยังไม่เข้าโซน แจ้งล่วงหน้า รอราคาย้อนเข้าโซนแล้วดูแท่งยืนยัน",
+        ]
+        parts = [title, f"📊 XAUUSD ({SYMBOL}) | TF 4H"] + lines + _h4r_tail(risk)
+        fire(f"h4c:{kind}_{side}", eid, "\n".join(p for p in parts if p))
+
+
+# แทนที่ check_choch_retrace เดิม (check_market เรียกชื่อนี้)
+def check_choch_retrace(df, levels, last_1h_start):
+    if H4R_KEEP_OLD:
+        try:
+            _orig_check_choch_retrace(df, levels, last_1h_start)
+        except Exception as ex:
+            print(f"SMC 4H (เดิม) error: {ex}")
+    if not H4R_ALERT or len(df) < 40:
+        return
+    try:
+        _h4r_retrace(df, levels, last_1h_start)
+    except Exception as ex:
+        print(f"H4R retrace error: {ex}")
+    try:
+        _h4r_early(df, levels, last_1h_start)
+    except Exception as ex:
+        print(f"H4R early error: {ex}")
+
+
+# ---------- สถิติท้ายสรุป: เติมส่วน SMC 4H ----------
+_orig_journal_lines_h4r = journal_lines
+
+
+def journal_lines(start_s, end_s):
+    out = list(_orig_journal_lines_h4r(start_s, end_s))
+    rs = [r for r in sent.get("journal", {}).values()
+          if r["sy"] == "h4r" and start_s < pd.Timestamp(r["t"]) <= end_s]
+    if not rs:
+        return out
+    if not out:
+        out = ["", "🧪 <b>สถิติสัญญาณบอท</b> (วัดตามแผน SL/เป้าที่แจ้ง)"]
+    pend = sum(1 for r in rs if _journal_pending(r))
+    out.append(f"SMC 4H CHoCH ย้อนชน + แท่งกลับตัว: {len(rs)} สัญญาณ" + (f" (รอผล {pend})" if pend else ""))
+    out.append(_jline("รวม", [(r, "rs") for r in rs]))
+    return out
+# <<< H4R PATCH
 
 
 if __name__ == "__main__":
