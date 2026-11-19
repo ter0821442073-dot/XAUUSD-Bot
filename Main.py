@@ -4125,6 +4125,51 @@ def journal_lines(start_s, end_s):
 # <<< H4R PATCH
 
 
+# >>> JNEW PATCH
+# สถิติท้ายสรุป: บันทึก/แสดงเฉพาะระบบที่อยู่ใน JOURNAL_SYSTEMS (ค่าเริ่มต้น = CHoCH รูปแบบใหม่ m15r, h4r)
+JOURNAL_SYSTEMS = set(x.strip() for x in os.environ.get("JOURNAL_SYSTEMS", "m15r,h4r").split(",") if x.strip())
+_orig_record_signal_jnew = record_signal
+
+
+def record_signal(system, kind, side, entry, tp, sl, sl_t, score):
+    if system not in JOURNAL_SYSTEMS:
+        return
+    return _orig_record_signal_jnew(system, kind, side, entry, tp, sl, sl_t, score)
+
+
+_J_NAMES = {"m15r": "SMC M15 CHoCH ย้อนชน + แท่งกลับตัว", "h4r": "SMC 4H CHoCH ย้อนชน + แท่งกลับตัว",
+            "smc": "SMC 4H (เดิม)", "ict": "ICT", "m15": "SMC M15 (เดิม)"}
+_J_PART = {"fvg": "FVG", "ob": "OB", "zone": "โซน 50–61.8%"}
+
+
+def journal_lines(start_s, end_s):
+    recs = [r for r in sent.get("journal", {}).values()
+            if r["sy"] in JOURNAL_SYSTEMS and start_s < pd.Timestamp(r["t"]) <= end_s]
+    if not recs:
+        return []
+    out = ["", "🧪 <b>สถิติสัญญาณบอท</b> (วัดตามแผน SL/เป้าที่แจ้ง)"]
+    for sy in ("m15r", "h4r", "smc", "ict", "m15"):
+        if sy not in JOURNAL_SYSTEMS:
+            continue
+        rs = [r for r in recs if r["sy"] == sy]
+        if not rs:
+            continue
+        pend = sum(1 for r in rs if _journal_pending(r))
+        out.append(f"{_J_NAMES[sy]}: {len(rs)} สัญญาณ" + (f" (รอผล {pend})" if pend else ""))
+        if sy in ("smc", "ict"):
+            out.append(_jline("SL แคบ", [(r, "rt") for r in rs if r["st"] is not None]))
+        out.append(_jline("SL โครงสร้าง" if sy in ("smc", "ict", "m15") else "รวม", [(r, "rs") for r in rs]))
+        if sy in ("m15r", "h4r"):
+            groups = {}
+            for r in rs:
+                groups.setdefault(r["k"].split("_", 1)[-1], []).append(r)
+            for lab, sub in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+                name = " + ".join(_J_PART.get(p, p) for p in lab.split("+"))
+                out.append(_jline(f"ชน {name}", [(r, "rs") for r in sub]))
+    return out
+# <<< JNEW PATCH
+
+
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
