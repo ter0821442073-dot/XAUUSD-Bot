@@ -4177,6 +4177,101 @@ def journal_lines(start_s, end_s):
 # <<< JNEW PATCH
 
 
+# >>> CHOCH_ONLY PATCH
+# CHoCH = ปิดทะลุ protected swing เท่านั้น / ทะลุสวิงตามเทรนด์ = BOS (ไม่แจ้งเตือน)
+# ลบบล็อกนี้เพื่อถอนแพทช์
+
+# ---- ปิด BOS ทุกระบบ (บังคับ ไม่สนใจ env) ----
+SMC_BOS = False
+M15_BOS = False
+M15C_BOS = False
+M15R_BOS = False
+H4R_BOS = False
+ICT_BOS = False
+OBFVG_BOS = False
+
+# ---- ค่า swing เริ่มต้น (ใช้ก็ต่อเมื่อไม่ได้ตั้ง env ไว้เอง) ----
+if "M15_SWING" not in os.environ:
+    M15_SWING = 5
+if "M15R_SWING" not in os.environ:
+    M15R_SWING = 5
+if "SMC_SWING" not in os.environ:
+    SMC_SWING = 3
+if "H4R_SWING" not in os.environ:
+    H4R_SWING = 3
+
+
+def find_structure(df, n):
+    if not STRUCT_STATE:
+        return _find_structure_legacy(df, n)
+    hi, lo = df["High"].values, df["Low"].values
+    cl, op = df["Close"].values, df["Open"].values
+    B = 3 if STRUCT_BREAK_BODY else 2          # 3 = วัดเนื้อเทียน / 2 = วัดไส้
+    piv, events = [], {}
+    trend, last, prot = None, None, None       # prot = swing ที่ป้องกันเทรนด์ (protected)
+    for j in range(2 * n, len(df)):
+        i = j - n
+        is_h = hi[i] > hi[i - n:i].max() and hi[i] >= hi[i + 1:j + 1].max()
+        is_l = lo[i] < lo[i - n:i].min() and lo[i] <= lo[i + 1:j + 1].min()
+        if is_h != is_l:
+            kind, price = ("H", float(hi[i])) if is_h else ("L", float(lo[i]))
+            body = float(max(op[i], cl[i])) if is_h else float(min(op[i], cl[i]))
+            if piv and piv[-1][1] == kind:
+                if (kind == "H" and price > piv[-1][2]) or (kind == "L" and price < piv[-1][2]):
+                    piv[-1] = (i, kind, price, body)
+            else:
+                piv.append((i, kind, price, body))
+            # ขาลงทำ LL ใหม่ -> protected = high ก่อนหน้า / ขาขึ้นทำ HH ใหม่ -> protected = low ก่อนหน้า
+            if trend and len(piv) >= 3 and piv[-3][1] == kind:
+                if trend == "down" and kind == "L" and piv[-1][2] < piv[-3][2]:
+                    prot = piv[-2]
+                elif trend == "up" and kind == "H" and piv[-1][2] > piv[-3][2]:
+                    prot = piv[-2]
+
+        highs = [p for p in piv if p[1] == "H"]
+        lows = [p for p in piv if p[1] == "L"]
+        if len(highs) < 2 or len(lows) < 2:
+            continue
+        h2, l2 = highs[-1], lows[-1]
+        if trend is None:
+            h1, l1 = highs[-2], lows[-2]
+            if h2[2] > h1[2] and l2[2] > l1[2]:
+                trend, prot = "up", l2
+            elif h2[2] < h1[2] and l2[2] < l1[2]:
+                trend, prot = "down", h2
+            else:
+                continue
+
+        if trend == "down":
+            if prot and cl[j] > prot[B]:                 # ปิดทะลุ protected high = CHoCH
+                kind, side, level = "choch", "buy", float(prot[B])
+                start = float(lo[l2[0]:j + 1].min())
+            elif cl[j] < l2[B]:                          # ทำ LL ใหม่ตามเทรนด์ = BOS
+                kind, side, level = "bos", "sell", float(l2[B])
+                start = float(hi[h2[0]:j + 1].max())
+            else:
+                continue
+        else:
+            if prot and cl[j] < prot[B]:                 # ปิดทะลุ protected low = CHoCH
+                kind, side, level = "choch", "sell", float(prot[B])
+                start = float(hi[h2[0]:j + 1].max())
+            elif cl[j] > h2[B]:                          # ทำ HH ใหม่ตามเทรนด์ = BOS
+                kind, side, level = "bos", "buy", float(h2[B])
+                start = float(lo[l2[0]:j + 1].min())
+            else:
+                continue
+        sig = (side, round(level, 2))
+        if last == sig:
+            continue
+        last = sig
+        if kind == "choch":                              # เทรนด์พลิก: protected ใหม่ = จุดสุดขอบของขาก่อน
+            trend = "up" if side == "buy" else "down"
+            prot = l2 if side == "buy" else h2
+        events[kind] = {"kind": kind, "side": side, "idx": j, "level": level, "start": start}
+    return events
+# <<< CHOCH_ONLY PATCH
+
+
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
