@@ -2488,6 +2488,9 @@ def obfvg_gate(df, ev, buy, z_bot, z_top, tag, atr_val):
 STRUCT_STATE = os.environ.get("STRUCT_STATE", "1") == "1"   # 1 = จำเทรนด์ต่อเนื่อง / 0 = ตรรกะเดิม
 
 
+STRUCT_BREAK_BODY = os.environ.get("STRUCT_BREAK_BODY", "1") == "1"   # BODYBREAK 1 = ปิดเหนือ/ใต้เนื้อเทียนของสวิงก็นับเบรก
+
+
 def find_structure(df, n):
     """สแกนแท่งที่ปิดแล้ว คืน {"choch": เหตุการณ์ล่าสุด, "bos": เหตุการณ์ล่าสุด}
     เทรนด์จำต่อเนื่อง: เริ่มจาก HH+HL หรือ LH+LL แล้วเปลี่ยนเฉพาะเมื่อมีการ "ปิดแท่งทะลุ" เท่านั้น
@@ -2497,6 +2500,7 @@ def find_structure(df, n):
     if not STRUCT_STATE:
         return _find_structure_legacy(df, n)
     hi, lo, cl = df["High"].values, df["Low"].values, df["Close"].values
+    op = df["Open"].values   # BODYBREAK
     piv, events = [], {}
     trend, last = None, None
     for j in range(2 * n, len(df)):
@@ -2505,11 +2509,12 @@ def find_structure(df, n):
         is_l = lo[i] < lo[i - n:i].min() and lo[i] <= lo[i + 1:j + 1].min()
         if is_h != is_l:
             kind, price = ("H", float(hi[i])) if is_h else ("L", float(lo[i]))
+            body = float(max(op[i], cl[i])) if is_h else float(min(op[i], cl[i]))   # BODYBREAK
             if piv and piv[-1][1] == kind:
                 if (kind == "H" and price > piv[-1][2]) or (kind == "L" and price < piv[-1][2]):
-                    piv[-1] = (i, kind, price)   # H/L ติดกัน เก็บตัวที่สุดขอบกว่า
+                    piv[-1] = (i, kind, price, body)   # H/L ติดกัน เก็บตัวที่สุดขอบกว่า
             else:
-                piv.append((i, kind, price))
+                piv.append((i, kind, price, body))
 
         highs = [p for p in piv if p[1] == "H"]
         lows = [p for p in piv if p[1] == "L"]
@@ -2525,12 +2530,14 @@ def find_structure(df, n):
             else:
                 continue
 
-        if cl[j] > h2[2]:
-            side, level = "buy", float(h2[2])
+        h_lvl = h2[3] if STRUCT_BREAK_BODY else h2[2]   # BODYBREAK
+        l_lvl = l2[3] if STRUCT_BREAK_BODY else l2[2]   # BODYBREAK
+        if cl[j] > h_lvl:
+            side, level = "buy", float(h_lvl)
             kind = "choch" if trend == "down" else "bos"
             start = float(lo[l2[0]:j + 1].min())     # CHoCH = LL / BOS = HL
-        elif cl[j] < l2[2]:
-            side, level = "sell", float(l2[2])
+        elif cl[j] < l_lvl:
+            side, level = "sell", float(l_lvl)
             kind = "choch" if trend == "up" else "bos"
             start = float(hi[h2[0]:j + 1].max())     # CHoCH = HH / BOS = LH
         else:
