@@ -4272,6 +4272,8 @@ def find_structure(df, n):
 # <<< CHOCH_ONLY PATCH
 
 
+
+
 # >>> M15N PATCH
 # ==========================================
 # SMC M15 ระบบใหม่ (รีเซ็ต) - ทับระบบ M15 เดิมทั้งหมด (m15 / m15c / m15r)
@@ -4307,6 +4309,10 @@ M15N_M1_MAX_AGE_MIN = int(os.environ.get("M15N_M1_MAX_AGE_MIN", "3"))  # แท�
 
 M15N_S2_ALERT = os.environ.get("M15N_S2_ALERT", "1") == "1"
 M15N_S2_SL_BUF = float(os.environ.get("M15N_S2_SL_BUF", "0.5"))        # SL เลยสวิงกี่ดอลลาร์
+
+# แจ้งเตือนเสริม: CHoCH + แท่ง M15 ปิดกลับ (ยังไม่ชนโซน) แจ้งทันที ไม่บันทึกสถิติ
+M15N_S0_ALERT = os.environ.get("M15N_S0_ALERT", "1") == "1"
+M15N_S0_MAX_AGE_MIN = int(os.environ.get("M15N_S0_MAX_AGE_MIN", "20"))  # แท่งปิดกลับต้องปิดไม่เกินกี่นาทีที่แล้ว (กันแจ้งของเก่าตอนรีสตาร์ท)
 
 # ---- ล้างสถิติ/สถานะ SMC M15 เก่า เริ่มนับใหม่ ----
 JOURNAL_SYSTEMS.discard("m15")
@@ -4541,6 +4547,46 @@ def _m15n_s2(x, st, risk, df, closed, cur, atr_val, tol):
             print(f"Journal record error: {ex}")
 
 
+def _m15n_s0(x, st, risk, closed, cur, atr_val, tol):
+    # แจ้งเตือนเสริม: CHoCH + แท่ง M15 ปิดกลับ แจ้งทันที (ไม่ record_signal = ไม่นับสถิติ)
+    buy = x["buy"]
+    start, extreme, z_bot, z_top = x["start"], x["extreme"], x["z_bot"], x["z_top"]
+    fvg, ob = _m15n_areas(closed, x["j"], x["k"], x["e"], buy, z_bot, z_top, tol)
+    what = "CHoCH ขาขึ้น" if buy else "CHoCH ขาลง"
+    act = "BUY" if buy else "SELL"
+    col = "แดง" if buy else "เขียว"
+    zone_txt = f"{M15N_FIB * 100:g}–{M15N_FIB_DEEP * 100:g}%"
+    dist = (cur - z_top) if buy else (z_bot - cur)
+    tags = [t for t, v in (("FVG", fvg), ("OB", ob)) if v]
+    tag_txt = f" + {' + '.join(tags)}" if tags else ""
+    title = f"🔔 <b>[SMC M15] {what}{tag_txt} + แท่ง{col}ปิดกลับ → เตรียมเข้าโซน {zone_txt} รอ {act}</b>"
+    s_lbl, brk = x["s_lbl"], x["brk"]
+    lines = [
+        f"🔓 ปิด{brk} <code>{px(x['level']):.2f}</code> (แท่ง M15 {fmt(x['j_time'])})",
+        f"📏 ขา: {s_lbl} <code>{px(start):.2f}</code> → {'จุดสูงสุด' if buy else 'จุดต่ำสุด'} <code>{px(extreme):.2f}</code> ({x['leg']:.2f} จุด)",
+        f"🎯 โซน {zone_txt}: <code>{px(z_bot):.2f}</code> – <code>{px(z_top):.2f}</code>",
+        f"🕯 แท่งปิดกลับ {fmt(x['arm_t'] - pd.Timedelta(minutes=15))}",
+        f"💵 ราคาตอนนี้: <code>{px(cur):.2f}</code> (ห่างโซน {dist:.2f} จุด / {dist / atr_val:.1f}×ATR)",
+    ]
+    if fvg:
+        lines.append(f"🟦 FVG: <code>{px(fvg[0]):.2f}</code> – <code>{px(fvg[1]):.2f}</code>")
+    else:
+        lines.append("🟦 FVG: ไม่พบ")
+    if ob:
+        lines.append(f"🟧 OB: <code>{px(ob[0]):.2f}</code> – <code>{px(ob[1]):.2f}</code>")
+    else:
+        lines.append("🟧 OB: ไม่พบ")
+    lines += [
+        f"🏁 เป้า: <code>{px(extreme):.2f}</code>",
+        "⏳ ยังไม่เข้าโซน แจ้งล่วงหน้า (ไม่นับสถิติ) รอราคาย้อนชนแล้วระบบจะแจ้งอีกครั้ง",
+    ]
+    parts = [title, f"📊 XAUUSD ({SYMBOL}) | TF M15"] + lines + _m15n_tail(risk)
+    if send_telegram_message("\n".join(p for p in parts if p)):
+        st["s0"] = True
+        save_state()
+        print("✅ ส่งแจ้งเตือน M15N แจ้งล่วงหน้า (CHoCH + แท่งปิดกลับ) แล้ว")
+
+
 def check_m15_new(levels):
     if not M15N_ALERT:
         return
@@ -4617,6 +4663,12 @@ def check_m15_new(levels):
          "z_bot": z_bot, "z_top": z_top, "level": ev["level"], "j_time": closed.index[j], "arm_t": arm_t,
          "s_lbl": ("LL" if buy else "HH"), "brk": ("เหนือ LH" if buy else "ใต้ HL")}
 
+    if (M15N_S0_ALERT and arm_t is not None and not entered and not st.get("s0")
+            and now - arm_t <= pd.Timedelta(minutes=M15N_S0_MAX_AGE_MIN)):
+        try:
+            _m15n_s0(x, st, risk, closed, cur, atr_val, tol)
+        except Exception as ex:
+            print(f"M15N S0 error: {ex}")
     if M15N_S1_ALERT and arm_t is not None and not entered and st["s1"] < M15N_S1_MAX:
         try:
             _m15n_s1(x, st, risk)
