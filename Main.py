@@ -4272,6 +4272,474 @@ def find_structure(df, n):
 # <<< CHOCH_ONLY PATCH
 
 
+# >>> M15N PATCH
+# ==========================================
+# SMC M15 ระบบใหม่ (รีเซ็ต) - ทับระบบ M15 เดิมทั้งหมด (m15 / m15c / m15r)
+# ขั้นตอน: M15 เกิด CHoCH -> มีแท่ง M15 ปิดสีสวนทางขา (แท่งปิดกลับ) -> ไปเฝ้า M1 ต่อ
+#   สัญญาณ 1 (M1 Stoch): ยังไม่ชนโซน 50-61.8 + Stoch M1 อยู่โซน OB/OS + แท่ง M1 ปิดกลับสีสวนทาง
+#       CHoCH ขาขึ้น -> Stoch >= 90 + แท่งแดงปิด -> SELL / CHoCH ขาลง -> Stoch <= 10 + แท่งเขียวปิด -> BUY
+#       SL/TP คงที่ (ค่าเริ่มต้น SL 200 จุด / TP 500 จุด)
+#   สัญญาณ 2 (ย้อนชน): ราคาย้อนกลับมาชนจุดเข้า แจ้งทันที ตามทิศ CHoCH
+#       มี FVG -> ชน FVG เป็นหลัก / ไม่มี FVG แต่มี OB -> ชน OB / ไม่มีทั้งคู่ -> ชนโซน 50-61.8
+#       SL = เลยสวิงจุดเริ่มขา / TP = สวิงสุดขอบก่อนหน้า
+# สถิติ WR แยก 2 ส่วนตามแผน SL/TP ส่งท้ายสรุปรายสัปดาห์/เดือน/ปี (สถิติ M15 เก่าถูกล้างทิ้ง เริ่มนับใหม่)
+# ลบบล็อกนี้เพื่อถอนแพทช์
+
+M15N_ALERT = os.environ.get("M15N_ALERT", "1") == "1"
+M15N_SWING = int(os.environ.get("M15N_SWING", str(M15_SWING)))
+M15N_MIN_LEG_ATR = float(os.environ.get("M15N_MIN_LEG_ATR", "1.0"))    # ขาต้องยาวอย่างน้อยกี่เท่า ATR M15
+M15N_MAX_AGE = int(os.environ.get("M15N_MAX_AGE", "32"))               # CHoCH เก่าสุดกี่แท่ง M15
+M15N_FIB = float(os.environ.get("M15N_FIB", "0.5"))
+M15N_FIB_DEEP = float(os.environ.get("M15N_FIB_DEEP", "0.618"))
+M15N_TOL_ATR = float(os.environ.get("M15N_TOL_ATR", "0.1"))            # เผื่อแตะโซน (เท่า ATR)
+M15N_TOUCH_BARS = int(os.environ.get("M15N_TOUCH_BARS", "2"))          # นับการชนจากกี่แท่ง M15 ล่าสุด (รวมแท่งสด)
+M15N_PT_USD = float(os.environ.get("M15N_PT_USD", "0.01"))             # 1 จุด = กี่ดอลลาร์ (0.01 = point ของ MT5 / ถ้า 200 จุด = $200 ตั้ง 1)
+
+M15N_S1_ALERT = os.environ.get("M15N_S1_ALERT", "1") == "1"
+M15N_S1_SL_PTS = float(os.environ.get("M15N_S1_SL_PTS", "200"))
+M15N_S1_TP_PTS = float(os.environ.get("M15N_S1_TP_PTS", "500"))
+M15N_S1_STOCH_OB = float(os.environ.get("M15N_S1_STOCH_OB", str(STOCH_OB)))
+M15N_S1_STOCH_OS = float(os.environ.get("M15N_S1_STOCH_OS", str(STOCH_OS)))
+M15N_S1_NEED_PREV = os.environ.get("M15N_S1_NEED_PREV", "1") == "1"    # 1 = แท่ง M1 ก่อนหน้าต้องเป็นสีตรงข้าม (เขียว->แดง / แดง->เขียว)
+M15N_S1_MAX = int(os.environ.get("M15N_S1_MAX", "1"))                  # แจ้งสัญญาณ 1 ได้กี่ครั้งต่อ CHoCH 1 ตัว
+M15N_S1_COOLDOWN_MIN = int(os.environ.get("M15N_S1_COOLDOWN_MIN", "10"))
+M15N_M1_MAX_AGE_MIN = int(os.environ.get("M15N_M1_MAX_AGE_MIN", "3"))  # แท่ง M1 ต้องปิดไม่เกินกี่นาทีที่แล้ว
+
+M15N_S2_ALERT = os.environ.get("M15N_S2_ALERT", "1") == "1"
+M15N_S2_SL_BUF = float(os.environ.get("M15N_S2_SL_BUF", "0.5"))        # SL เลยสวิงกี่ดอลลาร์
+
+# ---- ล้างสถิติ/สถานะ SMC M15 เก่า เริ่มนับใหม่ ----
+JOURNAL_SYSTEMS.discard("m15")
+JOURNAL_SYSTEMS.discard("m15r")
+JOURNAL_SYSTEMS.update({"m15a", "m15b"})
+
+
+def _m15n_purge_old():
+    try:
+        j = sent.get("journal", {})
+        old = [k for k, v in j.items() if v.get("sy") in ("m15", "m15r")]
+        for k in old:
+            j.pop(k, None)
+        keys = [k for k in list(sent) if str(k).startswith(("m15:", "m15c:", "m15r:", "m15c_touch:"))]
+        for k in keys:
+            sent.pop(k, None)
+        if old or keys:
+            save_state()
+            print(f"🧹 M15N: ล้างสถิติ SMC M15 เก่า {len(old)} สัญญาณ + คีย์เก่า {len(keys)} รายการ")
+    except Exception as ex:
+        print(f"M15N purge error: {ex}")
+
+
+_m15n_purge_old()
+
+
+def _m15n_state(side, eid):
+    st = sent.setdefault("m15n", {})
+    s = st.get(side)
+    if not s or s.get("eid") != eid:
+        s = {"eid": eid, "s1": 0, "s1_bar": None, "s1_t": None, "s2": False}
+        st[side] = s
+    return s
+
+
+def _m15n_areas(closed, j, k, e, buy, z_bot, z_top, tol):
+    # FVG / OB ในขา ที่อยู่ในโซน 50-61.8 หรือลึกกว่าโซน และยังไม่ถูกปิดทะลุ -> เลือกอันที่ราคาจะไปชนก่อน
+    hi, lo = closed["High"].values, closed["Low"].values
+    op, cl = closed["Open"].values, closed["Close"].values
+    n = len(closed)
+
+    def deep(a_lo, a_hi):
+        return (a_hi <= z_top + tol) if buy else (a_lo >= z_bot - tol)
+
+    fvgs = []
+    for i in range(max(k + 1, 1), min(e, n - 1)):
+        if buy:
+            g_lo, g_hi = float(hi[i - 1]), float(lo[i + 1])
+        else:
+            g_lo, g_hi = float(hi[i + 1]), float(lo[i - 1])
+        if g_lo >= g_hi:
+            continue
+        later = cl[i + 2:]
+        if len(later) and ((buy and later.min() < g_lo) or ((not buy) and later.max() > g_hi)):
+            continue
+        if deep(g_lo, g_hi):
+            fvgs.append((g_lo, g_hi))
+
+    obs = []
+    for i in range(k, min(j, n - 1) + 1):
+        if not ((cl[i] < op[i]) if buy else (cl[i] > op[i])):
+            continue
+        o_lo, o_hi = float(lo[i]), float(hi[i])
+        later = cl[i + 1:]
+        if len(later) and ((buy and later.min() < o_lo) or ((not buy) and later.max() > o_hi)):
+            continue
+        if deep(o_lo, o_hi):
+            obs.append((o_lo, o_hi))
+
+    if buy:
+        fvg = max(fvgs, key=lambda g: g[1]) if fvgs else None
+        ob = max(obs, key=lambda g: g[1]) if obs else None
+    else:
+        fvg = min(fvgs, key=lambda g: g[0]) if fvgs else None
+        ob = min(obs, key=lambda g: g[0]) if obs else None
+    return fvg, ob
+
+
+def _m15n_tail(risk):
+    parts = list(risk)
+    if PRICE_OFFSET:
+        parts.append(f"ℹ️ ราคาแสดงเป็นระดับ MT5 (GC=F − {PRICE_OFFSET:g})")
+    parts.append(data_source_note())
+    parts.append("📱 <b>เปิด MT5 เช็กกราฟก่อนตัดสินใจ</b>")
+    return parts
+
+
+def _m15n_s1(x, st, risk):
+    # สัญญาณ 1: เฝ้า M1 หลัง M15 มีแท่งปิดกลับ
+    buy, side = x["buy"], x["side"]
+    m1 = fetch_1m()
+    if m1 is None or len(m1) < 30:
+        return
+    now = now_server()
+    c1 = m1[m1.index + pd.Timedelta(minutes=1) <= now]
+    if len(c1) < 20:
+        return
+    ks = calculate_stoch(c1)
+    t_bar = c1.index[-1]
+    t_close = t_bar + pd.Timedelta(minutes=1)
+    if now - t_close > pd.Timedelta(minutes=M15N_M1_MAX_AGE_MIN):
+        return
+    if t_bar < x["arm_t"]:
+        return                                   # แท่ง M1 ต้องอยู่หลังแท่ง M15 ที่ปิดกลับ
+    o, h, l, c = ohlc(c1, -1)
+    po, _, _, pc = ohlc(c1, -2)
+    kk, kp = float(ks.iloc[-1]), float(ks.iloc[-2])
+    kv = [v for v in (kk, kp) if not pd.isna(v)]
+    if not kv:
+        return
+    if buy:      # CHoCH ขาขึ้น -> รอ M1 ขึ้นไป overbought แล้วแดงปิด = SELL
+        zone_ok = max(kv) >= M15N_S1_STOCH_OB
+        bar_ok = c < o and (pc > po or not M15N_S1_NEED_PREV)
+        act, bar_name, zone_txt = "sell", "แดง", f"Stoch ≥ {M15N_S1_STOCH_OB:g}"
+    else:        # CHoCH ขาลง -> รอ M1 ลงไป oversold แล้วเขียวปิด = BUY
+        zone_ok = min(kv) <= M15N_S1_STOCH_OS
+        bar_ok = c > o and (pc < po or not M15N_S1_NEED_PREV)
+        act, bar_name, zone_txt = "buy", "เขียว", f"Stoch ≤ {M15N_S1_STOCH_OS:g}"
+    k_txt = "-" if pd.isna(kk) else f"{kk:.1f}"
+    print(f"[M15N S1] {side} | M1 {fmt(t_bar)} O {o:.2f} C {c:.2f} | %K {k_txt} (ก่อนหน้า {kp:.1f}) | โซน Stoch={zone_ok} | แท่ง{bar_name}ปิดกลับ={bar_ok}")
+    if not (zone_ok and bar_ok):
+        return
+    if st["s1_bar"] == str(t_bar):
+        return
+    if st["s1_t"]:
+        try:
+            if now - pd.Timestamp(st["s1_t"]) < pd.Timedelta(minutes=M15N_S1_COOLDOWN_MIN):
+                return
+        except Exception:
+            pass
+
+    entry = c
+    sl_d, tp_d = M15N_S1_SL_PTS * M15N_PT_USD, M15N_S1_TP_PTS * M15N_PT_USD
+    if act == "sell":
+        sl, tp = entry + sl_d, entry - tp_d
+    else:
+        sl, tp = entry - sl_d, entry + tp_d
+    rr = tp_d / sl_d if sl_d > 0 else 0
+    what = "CHoCH ขาขึ้น" if buy else "CHoCH ขาลง"
+    title = (f"⚡ <b>[SMC M15] {what} + แท่ง M15 ปิดกลับ → M1 {zone_txt} + แท่ง{bar_name}ปิดกลับ "
+             f"→ {act.upper()} ทันที</b>")
+    s_lbl, brk = x["s_lbl"], x["brk"]
+    lines = [
+        f"🔓 ปิด{brk} <code>{px(x['level']):.2f}</code> (แท่ง M15 {fmt(x['j_time'])})",
+        f"📏 ขา: {s_lbl} <code>{px(x['start']):.2f}</code> → {'จุดสูงสุด' if buy else 'จุดต่ำสุด'} <code>{px(x['extreme']):.2f}</code>",
+        f"🎯 โซน {M15N_FIB * 100:g}–{M15N_FIB_DEEP * 100:g}%: <code>{px(x['z_bot']):.2f}</code> – <code>{px(x['z_top']):.2f}</code> (ราคายังไม่ชนโซน)",
+        f"🕯 M1 {fmt(t_bar)}: O <code>{px(o):.2f}</code> → C <code>{px(c):.2f}</code> | Stoch %K <code>{k_txt}</code>",
+        f"💵 เข้า: <code>{px(entry):.2f}</code>",
+        f"🛑 SL {M15N_S1_SL_PTS:g} จุด (${sl_d:.2f}): <code>{px(sl):.2f}</code>",
+        f"🏁 TP {M15N_S1_TP_PTS:g} จุด (${tp_d:.2f}): <code>{px(tp):.2f}</code> | R:R 1:{rr:.1f}",
+        "ℹ️ เป็นไม้สวนทิศ CHoCH (เล่นจังหวะย่อ/เด้ง) ระวังเทรนด์ M15 กลับไปต่อ",
+    ]
+    parts = [title, f"📊 XAUUSD ({SYMBOL}) | TF M15 → M1"] + lines + _m15n_tail(risk)
+    if send_telegram_message("\n".join(p for p in parts if p)):
+        st["s1"] += 1
+        st["s1_bar"] = str(t_bar)
+        st["s1_t"] = str(now)
+        save_state()
+        print("✅ ส่งแจ้งเตือน M15N สัญญาณ 1 แล้ว")
+        try:
+            record_signal("m15a", "choch", act, entry, tp, sl, None, None)
+        except Exception as ex:
+            print(f"Journal record error: {ex}")
+
+
+def _m15n_s2(x, st, risk, df, closed, cur, atr_val, tol):
+    # สัญญาณ 2: ราคาย้อนกลับมาชน FVG (หลัก) / OB / โซน 50-61.8
+    buy, side, e = x["buy"], x["side"], x["e"]
+    start, extreme = x["start"], x["extreme"]
+    z_bot, z_top = x["z_bot"], x["z_top"]
+    fvg, ob = _m15n_areas(closed, x["j"], x["k"], e, buy, z_bot, z_top, tol)
+    if fvg:
+        tname, (a_lo, a_hi) = "fvg", fvg
+    elif ob:
+        tname, (a_lo, a_hi) = "ob", ob
+    else:
+        tname, (a_lo, a_hi) = "zone", (z_bot, z_top)
+
+    after = df.iloc[e + 1:]
+    recent = after.iloc[-M15N_TOUCH_BARS:] if len(after) else after
+    if not len(recent):
+        return
+    if buy:
+        touch_px = float(recent["Low"].min())
+        touched = touch_px <= a_hi + tol and cur >= a_lo - tol and cur > start
+    else:
+        touch_px = float(recent["High"].max())
+        touched = touch_px >= a_lo - tol and cur <= a_hi + tol and cur < start
+    nm = {"fvg": "FVG", "ob": "OB", "zone": f"โซน {M15N_FIB * 100:g}–{M15N_FIB_DEEP * 100:g}%"}[tname]
+    print(f"[M15N S2] {side} เป้าชน {nm} {px(a_lo):.2f}-{px(a_hi):.2f} | ราคา {px(cur):.2f} | ชน={touched}")
+    if not touched:
+        return
+
+    entry = cur
+    sl = (start - M15N_S2_SL_BUF) if buy else (start + M15N_S2_SL_BUF)
+    tp = extreme
+    if (buy and not (sl < entry < tp)) or ((not buy) and not (tp < entry < sl)):
+        return
+    rr = abs(tp - entry) / abs(entry - sl)
+    what = "CHoCH ขาขึ้น" if buy else "CHoCH ขาลง"
+    act = "BUY" if buy else "SELL"
+    title = f"🎯 <b>[SMC M15] {what} + ราคาย้อนชน {nm} → {act} ทันที</b>"
+    s_lbl, brk = x["s_lbl"], x["brk"]
+    lines = [
+        f"🔓 ปิด{brk} <code>{px(x['level']):.2f}</code> (แท่ง M15 {fmt(x['j_time'])})",
+        f"📏 ขา: {s_lbl} <code>{px(start):.2f}</code> → {'จุดสูงสุด' if buy else 'จุดต่ำสุด'} <code>{px(extreme):.2f}</code> ({x['leg']:.2f} จุด)",
+        f"🎯 โซน {M15N_FIB * 100:g}–{M15N_FIB_DEEP * 100:g}%: <code>{px(z_bot):.2f}</code> – <code>{px(z_top):.2f}</code>",
+    ]
+    if fvg:
+        lines.append(f"🟦 FVG (เป้าหลัก): <code>{px(fvg[0]):.2f}</code> – <code>{px(fvg[1]):.2f}</code>" + (" ✅ ชนแล้ว" if tname == "fvg" else ""))
+    else:
+        lines.append("🟦 FVG: ไม่พบ")
+    if ob:
+        lines.append(f"🟧 OB: <code>{px(ob[0]):.2f}</code> – <code>{px(ob[1]):.2f}</code>" + (" ✅ ชนแล้ว" if tname == "ob" else ""))
+    else:
+        lines.append("🟧 OB: ไม่พบ")
+    if tname == "zone":
+        lines.append("ℹ️ ไม่มี FVG/OB จึงใช้โซน 50–61.8% เป็นจุดเข้า")
+    lines += [
+        f"📍 ราคาย้อนชนที่ <code>{px(touch_px):.2f}</code> | ราคาตอนนี้ <code>{px(cur):.2f}</code>",
+        f"🛑 SL (เลยสวิงจุดเริ่มขา {M15N_S2_SL_BUF:g}): <code>{px(sl):.2f}</code>",
+        f"🏁 TP (สวิงก่อนหน้า): <code>{px(tp):.2f}</code> | R:R 1:{rr:.1f}",
+    ]
+    parts = [title, f"📊 XAUUSD ({SYMBOL}) | TF M15"] + lines + _m15n_tail(risk)
+    if send_telegram_message("\n".join(p for p in parts if p)):
+        st["s2"] = True
+        save_state()
+        print("✅ ส่งแจ้งเตือน M15N สัญญาณ 2 แล้ว")
+        try:
+            record_signal("m15b", f"choch_{tname}", side, entry, tp, sl, None, None)
+        except Exception as ex:
+            print(f"Journal record error: {ex}")
+
+
+def check_m15_new(levels):
+    if not M15N_ALERT:
+        return
+    df = fetch_15m()
+    if df is None or len(df) < 40:
+        return
+    delta = pd.Timedelta(minutes=15)
+    now = now_server()
+    is_live = df.index[-1] + delta + pd.Timedelta(seconds=M15_LIVE_GRACE_SEC) > now
+    closed = df.iloc[:-1] if is_live else df
+    nc = len(closed)
+    if nc < 40:
+        return
+    atr_val = float(calculate_atr(closed).iloc[-1])
+    if pd.isna(atr_val) or atr_val <= 0:
+        return
+    risk = risk_notes(levels.get("news", []))
+    if SKIP_RISK_WINDOWS and risk:
+        return
+
+    events = find_structure(closed, M15N_SWING)
+    if not events:
+        return
+    ev = max(events.values(), key=lambda v: v["idx"])
+    if ev["kind"] != "choch":
+        return                                   # ล่าสุดเป็น BOS = ไม่มี setup
+    hi, lo = df["High"].values, df["Low"].values
+    op, cl = df["Open"].values, df["Close"].values
+    c = nc - 1
+    j = ev["idx"]
+    if c - j > M15N_MAX_AGE:
+        return
+    buy, start, side = ev["side"] == "buy", ev["start"], ev["side"]
+
+    a = max(0, j - 30)
+    win = lo[a:j + 1] if buy else hi[a:j + 1]
+    k = a + int(abs(win - start).argmin())
+    e = j + (int(hi[j:].argmax()) if buy else int(lo[j:].argmin()))
+    extreme = float(hi[e] if buy else lo[e])
+    leg = (extreme - start) if buy else (start - extreme)
+    if leg < M15N_MIN_LEG_ATR * atr_val:
+        return
+    cc = cl[j:nc]
+    if (cc.min() < start) if buy else (cc.max() > start):
+        return                                   # ขาพัง
+    if buy:
+        z_top, z_bot = extreme - leg * M15N_FIB, extreme - leg * M15N_FIB_DEEP
+    else:
+        z_bot, z_top = extreme + leg * M15N_FIB, extreme + leg * M15N_FIB_DEEP
+
+    cur = float(df["Close"].iloc[-1])
+    tol = M15N_TOL_ATR * atr_val
+    eid = str(closed.index[j])
+    st = _m15n_state(side, eid)
+
+    after = df.iloc[e + 1:]
+    entered = False
+    if len(after):
+        entered = (float(after["Low"].min()) <= z_top) if buy else (float(after["High"].max()) >= z_bot)
+    if (cur - z_top <= 0) if buy else (z_bot - cur <= 0):
+        entered = True
+
+    arm_i = None                                 # แท่ง M15 ปิดกลับสีสวนทางขา (แดงถ้าขาขึ้น / เขียวถ้าขาลง)
+    for i in range(e + 1, nc):
+        if (cl[i] < op[i]) if buy else (cl[i] > op[i]):
+            arm_i = i
+            break
+    arm_t = (closed.index[arm_i] + delta) if arm_i is not None else None
+
+    print(f"[M15N] CHoCH {side} แท่ง {fmt(closed.index[j])} | ขา {px(start):.2f}→{px(extreme):.2f} ({leg:.2f}) "
+          f"| โซน {px(z_bot):.2f}-{px(z_top):.2f} | ราคา {px(cur):.2f} | แท่งปิดกลับ={'-' if arm_t is None else fmt(arm_t)} | ชนโซนแล้ว={entered}")
+
+    x = {"buy": buy, "side": side, "j": j, "k": k, "e": e, "start": start, "extreme": extreme, "leg": leg,
+         "z_bot": z_bot, "z_top": z_top, "level": ev["level"], "j_time": closed.index[j], "arm_t": arm_t,
+         "s_lbl": ("LL" if buy else "HH"), "brk": ("เหนือ LH" if buy else "ใต้ HL")}
+
+    if M15N_S1_ALERT and arm_t is not None and not entered and st["s1"] < M15N_S1_MAX:
+        try:
+            _m15n_s1(x, st, risk)
+        except Exception as ex:
+            print(f"M15N S1 error: {ex}")
+    if M15N_S2_ALERT and not st["s2"]:
+        try:
+            _m15n_s2(x, st, risk, df, closed, cur, atr_val, tol)
+        except Exception as ex:
+            print(f"M15N S2 error: {ex}")
+
+
+# check_market เรียกสองชื่อนี้อยู่: ปิดตัวเก่า ใช้ตัวใหม่แทน
+def check_m15_retrace(levels):
+    return
+
+
+def check_m15_choch_early(levels):
+    check_m15_new(levels)
+
+
+# ---------- ตามผลสัญญาณ: สัญญาณ M15 ใหม่ใช้แท่ง M1 (แม่นกว่าเพราะ SL/TP ใกล้) ----------
+def monitor_journal():
+    if not JOURNAL_ENABLED:
+        return
+    j = sent.get("journal")
+    pend = [(k, r) for k, r in (j or {}).items() if _journal_pending(r)]
+    if not pend:
+        return
+    now = now_server()
+    m1, m1_loaded, b5 = None, False, None
+    changed = False
+    for _, r in pend:
+        t = pd.Timestamp(r["t"])
+        sub = None
+        if r["sy"] in ("m15a", "m15b"):
+            if not m1_loaded:
+                m1, m1_loaded = fetch_1m(), True
+            if m1 is not None and len(m1) and t >= m1.index[0]:
+                sub = m1[m1.index >= t.floor("min") + pd.Timedelta(minutes=1)]
+        if sub is None:
+            if b5 is None:
+                days = min((now - min(pd.Timestamp(v["t"]) for _, v in pend)).days + 2, 59)
+                b5 = fetch_5m(days)
+            if b5 is None:
+                continue
+            sub = b5[b5.index >= t.floor("5min") + pd.Timedelta(minutes=5)]
+        buy = r["d"] == "buy"
+        for key, slv in (("rs", r["s"]), ("rt", r["st"])):
+            if r[key] is not None or slv is None:
+                continue
+            if sub.empty:
+                continue
+            hit_sl = (sub["Low"] <= slv) if buy else (sub["High"] >= slv)
+            hit_tp = (sub["High"] >= r["tp"]) if buy else (sub["Low"] <= r["tp"])
+            anyh = hit_sl | hit_tp
+            if anyh.any():
+                first = anyh.idxmax()
+                r[key] = "sl" if bool(hit_sl.loc[first]) else "tp"   # SL/TP แท่งเดียวกัน นับเป็น SL
+                changed = True
+            elif now - t > pd.Timedelta(days=JOURNAL_MAX_DAYS):
+                r[key] = "exp"
+                changed = True
+    if changed:
+        save_state()
+
+
+# ---------- สถิติท้ายสรุป สัปดาห์/เดือน/ปี ----------
+_J_PART = {"fvg": "FVG", "ob": "OB", "zone": "โซน 50–61.8%"}
+
+
+def journal_lines(start_s, end_s):
+    recs = [r for r in sent.get("journal", {}).values()
+            if r["sy"] in JOURNAL_SYSTEMS and start_s < pd.Timestamp(r["t"]) <= end_s]
+    if not recs:
+        return []
+    out = ["", "🧪 <b>สถิติสัญญาณบอท</b> (วัดตามแผน SL/เป้าที่แจ้ง)"]
+
+    rs = [r for r in recs if r["sy"] == "m15a"]
+    if rs:
+        pend = sum(1 for r in rs if _journal_pending(r))
+        out.append(f"SMC M15 ส่วนที่ 1: M1 Stoch + แท่งปิดกลับ (SL {M15N_S1_SL_PTS:g} / TP {M15N_S1_TP_PTS:g} จุด): "
+                   f"{len(rs)} สัญญาณ" + (f" (รอผล {pend})" if pend else ""))
+        out.append(_jline("รวม", [(r, "rs") for r in rs]))
+        for sd, nm in (("sell", "SELL (หลัง CHoCH ขาขึ้น)"), ("buy", "BUY (หลัง CHoCH ขาลง)")):
+            sub = [r for r in rs if r["d"] == sd]
+            if sub:
+                out.append(_jline(nm, [(r, "rs") for r in sub]))
+
+    rs = [r for r in recs if r["sy"] == "m15b"]
+    if rs:
+        pend = sum(1 for r in rs if _journal_pending(r))
+        out.append(f"SMC M15 ส่วนที่ 2: ย้อนชน FVG/OB/โซน (SL สวิง / TP สวิงก่อนหน้า): "
+                   f"{len(rs)} สัญญาณ" + (f" (รอผล {pend})" if pend else ""))
+        out.append(_jline("รวม", [(r, "rs") for r in rs]))
+        groups = {}
+        for r in rs:
+            groups.setdefault(r["k"].split("_", 1)[-1], []).append(r)
+        for lab, sub in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+            out.append(_jline(f"ชน {_J_PART.get(lab, lab)}", [(r, "rs") for r in sub]))
+
+    for sy, name in (("h4r", "SMC 4H CHoCH ย้อนชน + แท่งกลับตัว"), ("smc", "SMC 4H (เดิม)"), ("ict", "ICT")):
+        if sy not in JOURNAL_SYSTEMS:
+            continue
+        rs = [r for r in recs if r["sy"] == sy]
+        if not rs:
+            continue
+        pend = sum(1 for r in rs if _journal_pending(r))
+        out.append(f"{name}: {len(rs)} สัญญาณ" + (f" (รอผล {pend})" if pend else ""))
+        if sy in ("smc", "ict"):
+            out.append(_jline("SL แคบ", [(r, "rt") for r in rs if r["st"] is not None]))
+        out.append(_jline("SL โครงสร้าง" if sy in ("smc", "ict") else "รวม", [(r, "rs") for r in rs]))
+        if sy == "h4r":
+            groups = {}
+            for r in rs:
+                groups.setdefault(r["k"].split("_", 1)[-1], []).append(r)
+            for lab, sub in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+                nm = " + ".join(_J_PART.get(p, p) for p in lab.split("+"))
+                out.append(_jline(f"ชน {nm}", [(r, "rs") for r in sub]))
+    return out
+# <<< M15N PATCH
+
+
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
