@@ -5058,6 +5058,150 @@ def find_structure_all(df, n):
 # <<< M15FILT PATCH
 
 
+# >>> M15FAST PATCH
+# แจ้งเตือน SMC M15 สัญญาณ 1 (CHoCH -> M1 Stoch แตะ 90/10 -> แท่ง M1 ปิดกลับ) แบบทันที
+# เดิมเช็กแค่รอบลูปหลัก (60 วิ + เวลาประมวลผล) ทำให้แจ้งช้า 1-2 นาที
+# ตัวใหม่: เธรดแยกเช็กทุก M15FAST_INTERVAL วินาที จากข้อมูล M1 ที่ EA ส่งเข้าหน่วยความจำ (ไม่เรียกเน็ต)
+# ทำงานเฉพาะเมื่อ MT5_FEED=1 และ EA ส่งราคาอยู่ (ถ้าใช้ Yahoo แท่ง M1 ล่าช้าเอง เธรดนี้จะไม่ทำงาน)
+# ลบบล็อกนี้เพื่อถอนแพทช์
+
+M15FAST_ON = os.environ.get("M15FAST_ON", "1") == "1"
+M15FAST_INTERVAL = float(os.environ.get("M15FAST_INTERVAL", "3"))   # เช็กทุกกี่วินาที
+M15FAST_CTX_TTL = int(os.environ.get("M15FAST_CTX_TTL", "150"))     # ลูปหลักไม่ต่ออายุเกินกี่วินาที = เลิกเฝ้า (กันเฝ้าของเก่า)
+
+_m15fast_lock = threading.Lock()
+_m15fast_ctx = {}
+_m15fast_logged = set()
+
+
+def _m15n_s1_core(x, st, risk):
+    """สัญญาณ 1 (เนื้อหาเหมือนของเดิม แต่ลง log เฉพาะครั้งแรกต่อแท่ง M1 กันท่วม Logs)"""
+    buy, side = x["buy"], x["side"]
+    m1 = fetch_1m()
+    if m1 is None or len(m1) < 30:
+        return
+    now = now_server()
+    c1 = m1[m1.index + pd.Timedelta(minutes=1) <= now]
+    if len(c1) < 20:
+        return
+    ks = calculate_stoch(c1)
+    t_bar = c1.index[-1]
+    t_close = t_bar + pd.Timedelta(minutes=1)
+    if now - t_close > pd.Timedelta(minutes=M15N_M1_MAX_AGE_MIN):
+        return
+    if t_bar < x["arm_t"]:
+        return
+    o, h, l, c = ohlc(c1, -1)
+    po, _, _, pc = ohlc(c1, -2)
+    kk, kp = float(ks.iloc[-1]), float(ks.iloc[-2])
+    kv = [v for v in (kk, kp) if not pd.isna(v)]
+    if not kv:
+        return
+    if buy:      # CHoCH ขาขึ้น -> M1 ขึ้นไป overbought แล้วแดงปิด = SELL
+        zone_ok = max(kv) >= M15N_S1_STOCH_OB
+        bar_ok = c < o and (pc > po or not M15N_S1_NEED_PREV)
+        act, bar_name, zone_txt = "sell", "แดง", f"Stoch ≥ {M15N_S1_STOCH_OB:g}"
+    else:        # CHoCH ขาลง -> M1 ลงไป oversold แล้วเขียวปิด = BUY
+        zone_ok = min(kv) <= M15N_S1_STOCH_OS
+        bar_ok = c > o and (pc < po or not M15N_S1_NEED_PREV)
+        act, bar_name, zone_txt = "buy", "เขียว", f"Stoch ≤ {M15N_S1_STOCH_OS:g}"
+    k_txt = "-" if pd.isna(kk) else f"{kk:.1f}"
+    lk = (f"{side}|{x['j_time']}", str(t_bar))
+    if lk not in _m15fast_logged:
+        if len(_m15fast_logged) > 500:
+            _m15fast_logged.clear()
+        _m15fast_logged.add(lk)
+        print(f"[M15N S1] {side} | M1 {fmt(t_bar)} O {o:.2f} C {c:.2f} | %K {k_txt} (ก่อนหน้า {kp:.1f}) "
+              f"| โซน Stoch={zone_ok} | แท่ง{bar_name}ปิดกลับ={bar_ok}")
+    if not (zone_ok and bar_ok):
+        return
+    if st["s1_bar"] == str(t_bar):
+        return
+    if st["s1_t"]:
+        try:
+            if now - pd.Timestamp(st["s1_t"]) < pd.Timedelta(minutes=M15N_S1_COOLDOWN_MIN):
+                return
+        except Exception:
+            pass
+
+    entry = c
+    sl_d, tp_d = M15N_S1_SL_PTS * M15N_PT_USD, M15N_S1_TP_PTS * M15N_PT_USD
+    if act == "sell":
+        sl, tp = entry + sl_d, entry - tp_d
+    else:
+        sl, tp = entry - sl_d, entry + tp_d
+    rr = tp_d / sl_d if sl_d > 0 else 0
+    what = "CHoCH ขาขึ้น" if buy else "CHoCH ขาลง"
+    title = (f"⚡ <b>[SMC M15] {what} + แท่ง M15 ปิดกลับ → M1 {zone_txt} + แท่ง{bar_name}ปิดกลับ "
+             f"→ {act.upper()} ทันที</b>")
+    s_lbl, brk = x["s_lbl"], x["brk"]
+    lines = [
+        f"🔓 ปิด{brk} <code>{px(x['level']):.2f}</code> (แท่ง M15 {fmt(x['j_time'])})",
+        f"📏 ขา: {s_lbl} <code>{px(x['start']):.2f}</code> → {'จุดสูงสุด' if buy else 'จุดต่ำสุด'} <code>{px(x['extreme']):.2f}</code>",
+        f"🎯 โซน {M15N_FIB * 100:g}–{M15N_FIB_DEEP * 100:g}%: <code>{px(x['z_bot']):.2f}</code> – <code>{px(x['z_top']):.2f}</code> (ราคายังไม่ชนโซน)",
+        f"🕯 M1 {fmt(t_bar)}: O <code>{px(o):.2f}</code> → C <code>{px(c):.2f}</code> | Stoch %K <code>{k_txt}</code>",
+        f"💵 เข้า: <code>{px(entry):.2f}</code>",
+        f"🛑 SL {M15N_S1_SL_PTS:g} จุด (${sl_d:.2f}): <code>{px(sl):.2f}</code>",
+        f"🏁 TP {M15N_S1_TP_PTS:g} จุด (${tp_d:.2f}): <code>{px(tp):.2f}</code> | R:R 1:{rr:.1f}",
+        "ℹ️ เป็นไม้สวนทิศ CHoCH (เล่นจังหวะย่อ/เด้ง) ระวังเทรนด์ M15 กลับไปต่อ",
+    ]
+    parts = [title, f"📊 XAUUSD ({SYMBOL}) | TF M15 → M1"] + lines + _m15n_tail(risk)
+    if send_telegram_message("\n".join(p for p in parts if p)):
+        st["s1"] += 1
+        st["s1_bar"] = str(t_bar)
+        st["s1_t"] = str(now)
+        save_state()
+        print(f"✅ ส่งแจ้งเตือน M15N สัญญาณ 1 แล้ว (ปิดแท่ง M1 {fmt(t_close)} / ส่งเมื่อ {fmt(now_server())} "
+              f"{now_server().strftime('%S')} วิ)")
+        try:
+            record_signal("m15a", "choch", act, entry, tp, sl, None, None)
+        except Exception as ex:
+            print(f"Journal record error: {ex}")
+
+
+def _m15n_s1(x, st, risk):
+    """ลูปหลักเรียกชื่อนี้: ลงทะเบียนให้เธรดเร็วเฝ้าต่อ แล้วเช็กทันที (ล็อกกันส่งซ้ำระหว่าง 2 เธรด)"""
+    with _m15fast_lock:
+        _m15fast_ctx[f"{x['side']}|{x['j_time']}"] = (x, st, risk, time.time())
+        _m15n_s1_core(x, st, risk)
+
+
+def _m15fast_entered(x):
+    """ราคาเข้าโซน 50–61.8 แล้วหรือยัง (เข้าแล้ว = ไม่แจ้งสัญญาณ 1)"""
+    m1 = fetch_1m()
+    if m1 is None:
+        return False
+    sub = m1[m1.index >= x["arm_t"]]
+    if sub.empty:
+        return False
+    if x["buy"]:
+        return float(sub["Low"].min()) <= x["z_top"]
+    return float(sub["High"].max()) >= x["z_bot"]
+
+
+def _m15fast_loop():
+    while True:
+        time.sleep(max(1.0, M15FAST_INTERVAL))
+        try:
+            if not (M15FAST_ON and FEED_ENABLED and feed_fresh() and is_market_open()):
+                continue
+            t0 = time.time()
+            with _m15fast_lock:
+                for k in [k for k, v in _m15fast_ctx.items() if t0 - v[3] > M15FAST_CTX_TTL]:
+                    _m15fast_ctx.pop(k, None)
+                for x, st, risk, _ in list(_m15fast_ctx.values()):
+                    if st["s1"] >= M15N_S1_MAX or _m15fast_entered(x):
+                        continue
+                    _m15n_s1_core(x, st, risk)
+        except Exception as ex:
+            print(f"M15FAST error: {ex}")
+
+
+if M15FAST_ON:
+    threading.Thread(target=_m15fast_loop, daemon=True).start()
+# <<< M15FAST PATCH
+
+
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
