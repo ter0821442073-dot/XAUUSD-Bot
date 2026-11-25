@@ -4792,6 +4792,272 @@ def journal_lines(start_s, end_s):
 # <<< M15N PATCH
 
 
+# >>> M15MULTI PATCH
+# SMC M15: ตรวจ CHoCH ได้หลายตัว (ล่าสุด M15MULTI_N ตัว) / ขาแต่ละตัวตัดที่ CHoCH ตัวถัดไป / state แยกต่อ CHoCH
+# แท่งปิดกลับนับตั้งแต่ "แท่งจุดสุดขอบ" (M15MULTI_ARM_ON_EXTREME=1) ไม่ต้องรอแท่งถัดไป
+# ลบบล็อกนี้เพื่อถอนแพทช์
+
+M15MULTI_N = int(os.environ.get("M15MULTI_N", "3"))                          # ตรวจ CHoCH ล่าสุดกี่ตัว
+M15MULTI_ARM_ON_EXTREME = os.environ.get("M15MULTI_ARM_ON_EXTREME", "1") == "1"   # 1 = แท่งจุดสุดขอบเองนับเป็นแท่งปิดกลับได้
+M15MULTI_ARM_CLOSE_PCT = float(os.environ.get("M15MULTI_ARM_CLOSE_PCT", "0.5"))   # แท่งจุดสุดขอบต้องปิดอยู่ในกี่ส่วนของช่วงแท่งฝั่งสวนทาง (0 = ไม่เช็ก)
+
+
+def find_structure_all(df, n):
+    """เหมือน find_structure (CHOCH_ONLY) แต่คืนรายการเหตุการณ์ทั้งหมดเรียงตามเวลา"""
+    hi, lo = df["High"].values, df["Low"].values
+    cl, op = df["Close"].values, df["Open"].values
+    B = 3 if STRUCT_BREAK_BODY else 2
+    piv, out = [], []
+    trend, last, prot = None, None, None
+    for j in range(2 * n, len(df)):
+        i = j - n
+        is_h = hi[i] > hi[i - n:i].max() and hi[i] >= hi[i + 1:j + 1].max()
+        is_l = lo[i] < lo[i - n:i].min() and lo[i] <= lo[i + 1:j + 1].min()
+        if is_h != is_l:
+            kind, price = ("H", float(hi[i])) if is_h else ("L", float(lo[i]))
+            body = float(max(op[i], cl[i])) if is_h else float(min(op[i], cl[i]))
+            if piv and piv[-1][1] == kind:
+                if (kind == "H" and price > piv[-1][2]) or (kind == "L" and price < piv[-1][2]):
+                    piv[-1] = (i, kind, price, body)
+            else:
+                piv.append((i, kind, price, body))
+            if trend and len(piv) >= 3 and piv[-3][1] == kind:
+                if trend == "down" and kind == "L" and piv[-1][2] < piv[-3][2]:
+                    prot = piv[-2]
+                elif trend == "up" and kind == "H" and piv[-1][2] > piv[-3][2]:
+                    prot = piv[-2]
+
+        highs = [p for p in piv if p[1] == "H"]
+        lows = [p for p in piv if p[1] == "L"]
+        if len(highs) < 2 or len(lows) < 2:
+            continue
+        h2, l2 = highs[-1], lows[-1]
+        if trend is None:
+            h1, l1 = highs[-2], lows[-2]
+            if h2[2] > h1[2] and l2[2] > l1[2]:
+                trend, prot = "up", l2
+            elif h2[2] < h1[2] and l2[2] < l1[2]:
+                trend, prot = "down", h2
+            else:
+                continue
+
+        if trend == "down":
+            if prot and cl[j] > prot[B]:
+                kind, side, level = "choch", "buy", float(prot[B])
+                start = float(lo[l2[0]:j + 1].min())
+            elif cl[j] < l2[B]:
+                kind, side, level = "bos", "sell", float(l2[B])
+                start = float(hi[h2[0]:j + 1].max())
+            else:
+                continue
+        else:
+            if prot and cl[j] < prot[B]:
+                kind, side, level = "choch", "sell", float(prot[B])
+                start = float(hi[h2[0]:j + 1].max())
+            elif cl[j] > h2[B]:
+                kind, side, level = "bos", "buy", float(h2[B])
+                start = float(lo[l2[0]:j + 1].min())
+            else:
+                continue
+        sig = (side, round(level, 2))
+        if last == sig:
+            continue
+        last = sig
+        if kind == "choch":
+            trend = "up" if side == "buy" else "down"
+            prot = l2 if side == "buy" else h2
+        out.append({"kind": kind, "side": side, "idx": j, "level": level, "start": start})
+    return out
+
+
+def _m15n_state(side, eid):
+    """สถานะแยกต่อ CHoCH แต่ละตัว (คีย์ = ทิศ|เวลาแท่งเบรก)"""
+    st = sent.setdefault("m15n", {})
+    key = f"{side}|{eid}"
+    s = st.get(key)
+    if not s:
+        s = {"eid": eid, "s1": 0, "s1_bar": None, "s1_t": None, "s2": False}
+        st[key] = s
+        if len(st) > 30:
+            for k in sorted(st, key=lambda k: st[k].get("eid", ""))[:len(st) - 30]:
+                st.pop(k, None)
+    return s
+
+
+def _m15multi_find_arm(buy, e, end_c, op, cl, hi, lo):
+    """หาแท่งปิดกลับแท่งแรก (BUY ขาขึ้น = แท่งแดง / SELL ขาลง = แท่งเขียว)
+    แท่งจุดสุดขอบ (e) นับได้ถ้าปิดสีสวนทาง และ (ถ้าตั้ง) ปิดอยู่ฝั่งสวนทางของช่วงแท่ง"""
+    first = e if M15MULTI_ARM_ON_EXTREME else e + 1
+    for i in range(first, end_c):
+        if not ((cl[i] < op[i]) if buy else (cl[i] > op[i])):
+            continue
+        if i == e and M15MULTI_ARM_CLOSE_PCT > 0:
+            rng = hi[i] - lo[i]
+            if rng <= 0:
+                continue
+            pos = (cl[i] - lo[i]) / rng if buy else (hi[i] - cl[i]) / rng   # ยิ่งน้อยยิ่งปิดไกลจากจุดสุดขอบ
+            if pos > M15MULTI_ARM_CLOSE_PCT:
+                continue
+        return i
+    return None
+
+
+def check_m15_new(levels):
+    if not M15N_ALERT:
+        return
+    df = fetch_15m()
+    if df is None or len(df) < 40:
+        print("[M15N] ข้อมูล M15 ไม่พอ/ดึงไม่ได้ ข้ามรอบนี้")
+        return
+    delta = pd.Timedelta(minutes=15)
+    now = now_server()
+    is_live = df.index[-1] + delta + pd.Timedelta(seconds=M15_LIVE_GRACE_SEC) > now
+    closed = df.iloc[:-1] if is_live else df
+    nc = len(closed)
+    if nc < 40:
+        return
+    atr_val = float(calculate_atr(closed).iloc[-1])
+    if pd.isna(atr_val) or atr_val <= 0:
+        return
+    risk = risk_notes(levels.get("news", []))
+    if SKIP_RISK_WINDOWS and risk:
+        return
+
+    allev = find_structure_all(closed, M15N_SWING)
+    chochs = [v for v in allev if v["kind"] == "choch"]
+    if not chochs:
+        print("[M15N] ไม่พบ CHoCH")
+        return
+
+    hi, lo = df["High"].values, df["Low"].values
+    op, cl = df["Open"].values, df["Close"].values
+    cur = float(df["Close"].iloc[-1])
+    tol = M15N_TOL_ATR * atr_val
+    c = nc - 1
+
+    for ci in range(max(0, len(chochs) - M15MULTI_N), len(chochs)):
+        ev = chochs[ci]
+        j = ev["idx"]
+        if c - j > M15N_MAX_AGE:
+            continue
+        end = chochs[ci + 1]["idx"] if ci + 1 < len(chochs) else len(df)   # ขาจบที่ CHoCH ตัวถัดไป
+        end_c = min(nc, end)
+        if end - j < 1:
+            continue
+        buy, start, side = ev["side"] == "buy", ev["start"], ev["side"]
+
+        a = max(0, j - 30)
+        win = lo[a:j + 1] if buy else hi[a:j + 1]
+        k = a + int(abs(win - start).argmin())
+        e = j + (int(hi[j:end].argmax()) if buy else int(lo[j:end].argmin()))
+        extreme = float(hi[e] if buy else lo[e])
+        leg = (extreme - start) if buy else (start - extreme)
+        tag = f"[M15N] CHoCH {side} {fmt(closed.index[j])}"
+        if leg < M15N_MIN_LEG_ATR * atr_val:
+            print(f"{tag}: ขาสั้น {leg:.2f} < {M15N_MIN_LEG_ATR:g}×ATR ข้าม")
+            continue
+        cc = cl[j:end_c]
+        if len(cc) and ((cc.min() < start) if buy else (cc.max() > start)):
+            print(f"{tag}: ขาพัง ข้าม")
+            continue
+        if buy:
+            z_top, z_bot = extreme - leg * M15N_FIB, extreme - leg * M15N_FIB_DEEP
+        else:
+            z_bot, z_top = extreme + leg * M15N_FIB, extreme + leg * M15N_FIB_DEEP
+
+        eid = str(closed.index[j])
+        st = _m15n_state(side, eid)
+
+        after = df.iloc[e + 1:end]
+        entered = False
+        if len(after):
+            entered = (float(after["Low"].min()) <= z_top) if buy else (float(after["High"].max()) >= z_bot)
+        if ci == len(chochs) - 1 and ((cur - z_top <= 0) if buy else (z_bot - cur <= 0)):
+            entered = True
+
+        arm_i = _m15multi_find_arm(buy, e, end_c, op, cl, hi, lo)
+        arm_t = (closed.index[arm_i] + delta) if arm_i is not None else None
+
+        print(f"{tag} | ขา {px(start):.2f}→{px(extreme):.2f} ({leg:.2f}) | โซน {px(z_bot):.2f}-{px(z_top):.2f} "
+              f"| ราคา {px(cur):.2f} | แท่งปิดกลับ={'-' if arm_t is None else fmt(arm_t)} | ชนโซนแล้ว={entered}")
+
+        x = {"buy": buy, "side": side, "j": j, "k": k, "e": e, "start": start, "extreme": extreme, "leg": leg,
+             "z_bot": z_bot, "z_top": z_top, "level": ev["level"], "j_time": closed.index[j], "arm_t": arm_t,
+             "s_lbl": ("LL" if buy else "HH"), "brk": ("เหนือ LH" if buy else "ใต้ HL")}
+
+        if (M15N_S0_ALERT and arm_t is not None and not entered and not st.get("s0")
+                and now - arm_t <= pd.Timedelta(minutes=M15N_S0_MAX_AGE_MIN)):
+            try:
+                _m15n_s0(x, st, risk, closed, cur, atr_val, tol)
+            except Exception as ex:
+                print(f"M15N S0 error: {ex}")
+        if M15N_S1_ALERT and arm_t is not None and not entered and st["s1"] < M15N_S1_MAX:
+            try:
+                _m15n_s1(x, st, risk)
+            except Exception as ex:
+                print(f"M15N S1 error: {ex}")
+        if M15N_S2_ALERT and not st["s2"]:
+            try:
+                _m15n_s2(x, st, risk, df, closed, cur, atr_val, tol)
+            except Exception as ex:
+                print(f"M15N S2 error: {ex}")
+# <<< M15MULTI PATCH
+
+
+# >>> M15FILT PATCH
+# กรอง CHoCH ของ SMC M15 ที่เกิดจากการพักตัว: ต้องผ่านทั้ง 2 เงื่อนไข
+#   1) แท่งเบรกต้องมีตัวแท่ง >= M15F_DISP_ATR เท่าของ ATR (วิ่งแรงจริง ไม่ใช่ปิดเลยเส้นนิดเดียว)
+#   2) ระดับที่เบรกต้องย้อนเข้าไปในขาแรงก่อนหน้าอย่างน้อย M15F_RETRACE (0.5 = ครึ่งหนึ่งของขา)
+# ตั้ง M15F_ON=0 เพื่อปิด / ลบบล็อกนี้เพื่อถอนแพทช์
+
+M15F_ON = os.environ.get("M15F_ON", "1") == "1"
+M15F_DISP_ATR = float(os.environ.get("M15F_DISP_ATR", "0.8"))      # ตัวแท่งเบรก >= กี่เท่า ATR
+M15F_RETRACE = float(os.environ.get("M15F_RETRACE", "0.5"))        # เบรกต้องย้อนขาก่อนหน้าอย่างน้อยกี่ส่วน (0 = ไม่เช็ก)
+M15F_LOOKBACK = int(os.environ.get("M15F_LOOKBACK", "40"))         # หาต้นขาก่อนหน้าย้อนไปกี่แท่งจากจุดเริ่มขา
+
+_m15f_orig = find_structure_all
+
+
+def find_structure_all(df, n):
+    evs = _m15f_orig(df, n)
+    if not M15F_ON:
+        return evs
+    hi, lo = df["High"].values, df["Low"].values
+    op, cl = df["Open"].values, df["Close"].values
+    atr = calculate_atr(df).values
+    out = []
+    for ev in evs:
+        if ev["kind"] != "choch":
+            out.append(ev)
+            continue
+        j, buy = ev["idx"], ev["side"] == "buy"
+        why = None
+        a_j = atr[j]
+        body = abs(cl[j] - op[j])
+        if not pd.isna(a_j) and a_j > 0 and body < M15F_DISP_ATR * a_j:
+            why = f"แท่งเบรกตัวเล็ก {body / a_j:.1f}×ATR < {M15F_DISP_ATR:g}"
+        elif M15F_RETRACE > 0:
+            a0 = max(0, j - 60)
+            seg = lo[a0:j + 1] if buy else hi[a0:j + 1]
+            s = a0 + int(np.abs(seg - ev["start"]).argmin())      # แท่งจุดเริ่มขา (LL / HH)
+            b0 = max(0, s - M15F_LOOKBACK)
+            if buy:
+                leg = float(hi[b0:s + 1].max()) - ev["start"]
+                ret = (ev["level"] - ev["start"]) / leg if leg > 0 else 0.0
+            else:
+                leg = ev["start"] - float(lo[b0:s + 1].min())
+                ret = (ev["start"] - ev["level"]) / leg if leg > 0 else 0.0
+            if ret < M15F_RETRACE:
+                why = f"เบรกย้อนขาก่อนหน้าแค่ {ret:.0%} < {M15F_RETRACE:.0%} (น่าจะเป็นการพักตัว)"
+        if why:
+            if j >= len(df) - 40:
+                print(f"[M15F] ตัด CHoCH {ev['side']} {fmt(df.index[j])}: {why}")
+            continue
+        out.append(ev)
+    return out
+# <<< M15FILT PATCH
+
+
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
