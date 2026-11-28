@@ -4792,6 +4792,45 @@ def journal_lines(start_s, end_s):
 # <<< M15N PATCH
 
 
+# >>> LEDGERFIX PATCH
+# ไม้ที่ปิดแล้ว (อยู่ในสมุดบันทึก ledger) ต้องไม่กลับไปเป็น "ยังเปิดอยู่" เพราะข้อมูลราคารอบหลังตรวจไม่เจอ
+# เช่น ตอนสลับไปใช้ Yahoo สำรอง ราคาถูกปรับด้วย offset แล้วคลาดเคลื่อน SL แคบๆ จึงไม่ถูกตรวจเจอ
+# ลบบล็อกนี้เพื่อถอนแพทช์
+
+_orig_evaluate_trade_lf = evaluate_trade
+
+
+def evaluate_trade(t, bars):
+    r = _orig_evaluate_trade_lf(t, bars)
+    try:
+        if t.get("exit") is not None:
+            return r
+        e = sent.get("ledger", {}).get(t["id"])
+        if r["status"] in ("open", "unknown") and e:
+            return ledger_to_result(t["id"], e)          # เคยปิดแล้ว ใช้ผลเดิม
+        if r["status"] == "closed" and (not FEED_ENABLED or feed_fresh()):
+            remember_closed(t, r)                        # จดเฉพาะตอนใช้ราคาจริงจาก MT5 (กันจดผลจากข้อมูลสำรองที่เพี้ยน)
+    except Exception as ex:
+        print(f"LEDGERFIX error: {ex}")
+    return r
+
+
+def merge_with_ledger(results):
+    led = sent.get("ledger", {})
+    out, seen = [], set()
+    for r in results:
+        seen.add(r["id"])
+        if r["status"] in ("open", "unknown") and r["id"] in led:
+            out.append(ledger_to_result(r["id"], led[r["id"]]))
+        else:
+            out.append(r)
+    for tid, e in led.items():
+        if tid not in seen:
+            out.append(ledger_to_result(tid, e))
+    return out
+# <<< LEDGERFIX PATCH
+
+
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
